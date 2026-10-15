@@ -13,7 +13,7 @@ COPY ./requirements.txt /app/
 RUN pip install --upgrade pip
 
 # Install torch separately to avoid conflicts (important)
-RUN pip install torch==2.2.0+cpu --index-url https://download.pytorch.org/whl/cpu
+RUN pip install torch==2.5.1+cpu --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir numpy==1.24.4
 
 # Now install remaining packages
