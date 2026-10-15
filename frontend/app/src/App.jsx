@@ -10,7 +10,7 @@ const queryClient = new QueryClient();
 function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <Router basename="/">
+      <Router basename={import.meta.env.VITE_BASE_PATH || "/"}>
         <AppWrapper />
       </Router>
     </QueryClientProvider>
