@@ -9,12 +9,18 @@ load_dotenv()
 app = FastAPI(title="API Gateway")
 app.router.redirect_slashes = True
 
+allowed_origins = [
+    origin.strip() for origin in os.getenv(
+        "CAREER_ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:8080"
+    ).split(",") if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or ["*"] for development
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],  # or ["GET", "POST", "PUT", "DELETE"]
-    allow_headers=["*"],  # or ["Authorization", "Content-Type"]
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 @app.get("/")

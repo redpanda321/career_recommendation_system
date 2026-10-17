@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.concurrency import asynccontextmanager
 from app.routers.jobs import router as jobs_router
+from app.routers.career import router as career_router
 from app.database import create_db_and_tables
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -23,6 +24,7 @@ app.add_middleware(
 
 # Register the jobs router
 app.include_router(jobs_router, prefix="/jobs")
+app.include_router(career_router, prefix="/career-workspace")
 
 @app.get("/")
 async def root():

@@ -3,6 +3,7 @@ import unittest
 from app.routes.career_workspace import (
     AiJobSearchRecord,
     CareerOpsRecord,
+    ProficientlyRecord,
     WorkspaceImportRequest,
     build_workspace_preview,
 )
@@ -35,6 +36,22 @@ class CareerWorkspacePreviewTests(unittest.TestCase):
 
         self.assertEqual(preview.applications[0].stage, "closed")
         self.assertEqual(preview.applications[0].fit_score, 100)
+
+    def test_merges_proficiently_with_other_sources(self):
+        preview = build_workspace_preview(WorkspaceImportRequest(
+            ai_job_search=[AiJobSearchRecord(
+                company="Acme", role="Engineer", fit_rating=80,
+                job_url="https://example.com/job/1",
+            )],
+            proficiently=[ProficientlyRecord(
+                company="acme", role="engineer", status="applied", job_url="https://example.com/job/1",
+            )],
+        ))
+
+        self.assertEqual(preview.duplicate_count, 1)
+        self.assertEqual(preview.applications[0].sources, ["ai-job-search", "proficiently"])
+        self.assertEqual(preview.applications[0].stage, "applied")
+        self.assertEqual(preview.applications[0].url, "https://example.com/job/1")
 
 
 if __name__ == "__main__":
