@@ -124,9 +124,11 @@ spec:
         ports: [{containerPort: 8000}]
         env:
         - {name: SECRET_KEY, valueFrom: {secretKeyRef: {name: career-compass-secrets, key: SECRET_KEY}}}
+        - {name: CAREER_ALLOWED_ORIGINS, value: https://staging.hangent.com}
         - {name: AUTH_SERVICE_URL, value: http://career-compass-user:8001/auth}
         - {name: USER_SERVICE_URL, value: http://career-compass-user:8001/users}
         - {name: JOB_SERVICE_URL, value: http://career-compass-job:8004/jobs}
+        - {name: JOB_CAREER_SERVICE_URL, value: http://career-compass-job:8004/career-workspace}
         - {name: RECOMMEND_SERVICE_URL, value: http://career-compass-recommendation:8002/recommendations}
         - {name: CHATBOT_SERVICE_URL, value: http://career-compass-chatbot:8006/faq}
 ---
@@ -163,6 +165,7 @@ spec:
         image: IMAGE_PREFIX_PLACEHOLDER/hanggent-career-compass-job:TAG_PLACEHOLDER
         ports: [{containerPort: 8004}]
         env:
+        - {name: SECRET_KEY, valueFrom: {secretKeyRef: {name: career-compass-secrets, key: SECRET_KEY}}}
         - {name: DATABASE_URL, value: postgresql+asyncpg://career:CAREER_DB_PASSWORD_PLACEHOLDER@career-compass-postgres:5432/job_service_db}
         - {name: EMBEDDING_SERVICE_URL, value: http://career-compass-embedding:8003/embed/job}
         - {name: VECTORDB_SERVICE_URL, value: http://career-compass-vector:8005/store}

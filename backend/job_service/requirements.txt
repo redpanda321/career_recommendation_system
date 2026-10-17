@@ -9,3 +9,4 @@ pydantic[email]
 python-dotenv==1.0.0
 asyncpg==0.29.0 
 python-multipart
+python-jose
