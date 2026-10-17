@@ -1,3 +1,4 @@
+from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
@@ -17,8 +18,27 @@ Base = declarative_base()
 # This function is used in app startup to create tables
 async def create_db_and_tables():
     async with engine.begin() as conn:
-        # await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
+        await ensure_submission_worker_columns(conn)
+
+
+async def ensure_submission_worker_columns(conn):
+    """Add lease columns to an existing table without rewriting attempts."""
+    # create_all does not upgrade tables already present on staging.
+    columns = await conn.run_sync(lambda sync_conn: {
+        column["name"] for column in inspect(sync_conn).get_columns("submission_attempts")
+    })
+    new_columns = {
+        "claim_token_hash": "VARCHAR(64)",
+        "lease_until": "TIMESTAMP WITH TIME ZONE",
+        "browser_session_id": "VARCHAR(100)",
+    }
+    for name, kind in new_columns.items():
+        if name not in columns:
+            optional = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
+            await conn.exec_driver_sql(
+                f"ALTER TABLE submission_attempts ADD COLUMN {optional}{name} {kind}"
+            )
 
 # Dependency for FastAPI routes
 async def get_db():
