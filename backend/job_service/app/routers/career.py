@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.career_auth import career_user
 from app.database import get_db
 from app.models import (
-    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerStageEvent,
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
 )
 
@@ -74,6 +74,12 @@ class ApplicationIn(BaseModel):
     score_kind: str = Field(default="unverified", pattern="^(unverified|resume_overlap|career_ops_import|career_ops_evaluation)$")
     sources: list[str] = Field(default_factory=list, max_length=5)
     notes: list[str] = Field(default_factory=list, max_length=20)
+
+
+class PipelineIn(BaseModel):
+    job_url: str = Field(min_length=10, max_length=2000)
+    company: str = Field(default="", max_length=200)
+    role: str = Field(default="", max_length=200)
 
 
 class CandidateProfileIn(BaseModel):
@@ -150,6 +156,14 @@ def _application_out(
         "blocking_attempt_status": blocking_attempt[1] if blocking_attempt else None,
         "last_contact_at": latest_contact.contacted_at if latest_contact else None,
         "next_followup_at": latest_contact.next_followup_at if latest_contact else None,
+    }
+
+
+def _pipeline_out(item: CareerPipelineEntry) -> dict:
+    return {
+        "id": item.id, "job_url": item.job_url, "company": item.company,
+        "role": item.role, "status": item.status,
+        "created_at": item.created_at, "updated_at": item.updated_at,
     }
 
 
@@ -457,6 +471,45 @@ async def list_applications(user_id: str = Depends(career_user), db: AsyncSessio
                              latest_contact=latest_contacts.get(row.id)) for row in rows]
 
 
+@router.get("/pipeline")
+async def list_pipeline(user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(select(CareerPipelineEntry).where(
+        CareerPipelineEntry.user_id == user_id,
+    ).order_by(CareerPipelineEntry.created_at.desc()))).scalars().all()
+    return [_pipeline_out(row) for row in rows]
+
+
+@router.post("/pipeline")
+async def queue_pipeline_url(
+    body: PipelineIn, user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    try:
+        url = canonical_url(body.job_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    url_key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    row = (await db.execute(select(CareerPipelineEntry).where(
+        CareerPipelineEntry.user_id == user_id, CareerPipelineEntry.url_key == url_key,
+    ))).scalar_one_or_none()
+    if row is None:
+        row = CareerPipelineEntry(
+            user_id=user_id, url_key=url_key, job_url=url,
+            company=body.company.strip(), role=body.role.strip(), status="pending",
+        )
+        db.add(row)
+    else:
+        row.company = body.company.strip() or row.company
+        row.role = body.role.strip() or row.role
+        # An evaluated URL must not return to the pending inbox on a re-save.
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(409, "Job URL was concurrently queued; retry") from exc
+    await db.refresh(row)
+    return _pipeline_out(row)
+
+
 @router.get("/applications/{application_id}")
 async def get_application(
     application_id: str, user_id: str = Depends(career_user),
@@ -523,6 +576,20 @@ async def upsert_application(
         elif body.fit_score is not None and row.score_kind not in {"career_ops_evaluation", "career_ops_import"}:
             row.fit_score = max(row.fit_score or 0, body.fit_score)
             row.score_kind = body.score_kind
+    if url:
+        url_key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        inbox = (await db.execute(select(CareerPipelineEntry).where(
+            CareerPipelineEntry.user_id == user_id, CareerPipelineEntry.url_key == url_key,
+        ))).scalar_one_or_none()
+        processed = row.stage != "saved" or row.score_kind == "career_ops_evaluation"
+        if inbox is None:
+            db.add(CareerPipelineEntry(
+                user_id=user_id, url_key=url_key, job_url=url,
+                company=row.company, role=row.role,
+                status="processed" if processed else "pending",
+            ))
+        elif processed:
+            inbox.status = "processed"
     try:
         await db.commit()
     except IntegrityError as exc:

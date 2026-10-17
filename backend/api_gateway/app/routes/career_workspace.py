@@ -233,6 +233,16 @@ async def list_canonical_applications(request: Request, _user: str = Depends(car
     return await _forward(request, "applications", "GET")
 
 
+@router.get("/pipeline")
+async def list_canonical_pipeline(request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, "pipeline", "GET")
+
+
+@router.post("/pipeline")
+async def save_canonical_pipeline_url(request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, "pipeline", "POST", await request.json())
+
+
 @router.get("/profile")
 async def get_canonical_profile(request: Request, _user: str = Depends(career_user)):
     return await _forward(request, "profile", "GET")

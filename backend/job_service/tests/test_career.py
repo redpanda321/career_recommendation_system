@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.database import AsyncSessionLocal, Base, engine
 from app.database import ensure_career_score_kind
 from app.models import (
-    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerStageEvent,
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
 )
 from app.routers.career import router
@@ -44,6 +44,7 @@ def setup_module():
             await connection.run_sync(Base.metadata.create_all, tables=[
                 CareerApplication.__table__, CareerArtifact.__table__,
                 CareerCandidateProfile.__table__, CareerStageEvent.__table__, CareerContactEvent.__table__,
+                CareerPipelineEntry.__table__,
                 SubmissionAuthorization.__table__, SubmissionAttempt.__table__,
             ])
     asyncio.run(create_tables())
@@ -60,6 +61,56 @@ def test_requires_scoped_bridge_identity():
         assert client.get("/career-workspace/applications", headers={
             "Authorization": f"Bearer {ordinary}",
         }).status_code == 401
+
+
+def test_pipeline_is_database_owned_and_user_isolated(monkeypatch, tmp_path):
+    # A leftover file-root setting must not redirect the canonical write path.
+    monkeypatch.setenv("CAREER_OPS_DATA_ROOT", str(tmp_path / "unused"))
+    with TestClient(app) as client:
+        url = "https://jobs.example.com/acme/991"
+        queued = client.post("/career-workspace/pipeline", headers=headers(991), json={
+            "job_url": url, "company": "Acme", "role": "Engineer",
+        })
+        assert queued.status_code == 200, queued.text
+        repeated = client.post("/career-workspace/pipeline", headers=headers(991), json={
+            "job_url": url, "company": "Acme", "role": "Engineer",
+        })
+        assert repeated.status_code == 200 and repeated.json()["id"] == queued.json()["id"]
+        assert len(client.get("/career-workspace/pipeline", headers=headers(991)).json()) == 1
+        assert client.get("/career-workspace/pipeline", headers=headers(992)).json() == []
+
+        evaluated = client.post("/career-workspace/applications", headers=headers(991), json={
+            "company": "Acme", "role": "Engineer", "job_url": url,
+            "fit_score": 88, "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
+        })
+        assert evaluated.status_code == 200, evaluated.text
+        assert client.get("/career-workspace/pipeline", headers=headers(991)).json()[0]["status"] == "processed"
+        assert not (tmp_path / "unused").exists()
+
+        saved_profile = client.put("/career-workspace/profile", headers=headers(991), json={
+            "full_name": "Alex", "resume_markdown": "# CV",
+        })
+        assert saved_profile.status_code == 200
+        assert client.get("/career-workspace/profile", headers=headers(991)).json()["full_name"] == "Alex"
+        feedback = client.post(
+            f"/career-workspace/applications/{evaluated.json()['id']}/feedback",
+            headers=headers(991), json={"stage": "applied", "note": "Submitted myself"},
+        )
+        assert feedback.status_code == 200
+        material = client.post(
+            f"/career-workspace/applications/{evaluated.json()['id']}/artifacts",
+            headers=headers(991), json={
+                "kind": "cover_letter", "source": "career-ops", "content_markdown": "# Reviewed",
+            },
+        )
+        assert material.status_code == 200
+        activity = client.get(
+            f"/career-workspace/applications/{evaluated.json()['id']}/activity",
+            headers=headers(991),
+        ).json()
+        assert activity["feedback"][0]["note"] == "Submitted myself"
+        assert activity["artifacts"][0]["content_markdown"] == "# Reviewed"
+        assert not (tmp_path / "unused").exists()
 
 
 def test_applications_are_idempotent_and_user_isolated():

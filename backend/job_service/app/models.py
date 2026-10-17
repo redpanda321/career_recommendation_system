@@ -57,6 +57,27 @@ class CareerApplication(Base):
     )
 
 
+class CareerPipelineEntry(Base):
+    """Candidate-owned URL inbox; PostgreSQL is authoritative."""
+
+    __tablename__ = "career_pipeline_entries"
+    __table_args__ = (
+        UniqueConstraint("user_id", "url_key", name="uq_career_pipeline_user_url"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(80), nullable=False, index=True)
+    url_key = Column(String(64), nullable=False)
+    job_url = Column(Text, nullable=False)
+    company = Column(String(200), nullable=False, default="")
+    role = Column(String(200), nullable=False, default="")
+    status = Column(String(20), nullable=False, default="pending")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class CareerCandidateProfile(Base):
     """Candidate-owned facts shared by the career workflow, never site credentials."""
 
