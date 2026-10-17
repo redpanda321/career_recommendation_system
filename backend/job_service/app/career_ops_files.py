@@ -192,7 +192,9 @@ def read_tracker(user_id: str) -> list[dict]:
     return result
 
 
-def write_application(user_id: str, item: dict) -> None:
+def write_application(
+    user_id: str, item: dict, *, adopt_native_id: str | None = None
+) -> None:
     """Upsert a Hanggent row while preserving all other career-ops rows and columns."""
     base = workspace(user_id)
     path = _tracker_path(base)
@@ -246,7 +248,7 @@ def write_application(user_id: str, item: dict) -> None:
                             f"career-ops:{user_id}:{_parts(line)[0]}",
                         )
                     )
-                    == item["id"]
+                    == (adopt_native_id or item["id"])
                 ),
                 None,
             )
@@ -299,10 +301,18 @@ def write_application(user_id: str, item: dict) -> None:
         atomic_write(path, "\n".join(lines).rstrip() + "\n")
 
 
-def read_application(user_id: str, application_id: str) -> dict | None:
-    row = next(
-        (row for row in read_tracker(user_id) if row.get("id") == application_id), None
-    )
+def read_application(
+    user_id: str, application_id: str, *, row: dict | None = None
+) -> dict | None:
+    if row is None:
+        row = next(
+            (
+                item
+                for item in read_tracker(user_id)
+                if item.get("id") == application_id
+            ),
+            None,
+        )
     if row is None:
         return None
     base = workspace(user_id)

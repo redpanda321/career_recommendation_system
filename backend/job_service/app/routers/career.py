@@ -189,12 +189,12 @@ async def _sync_file_index(user_id: str, db: AsyncSession) -> None:
     existing = (await db.execute(select(CareerApplication).where(
         CareerApplication.user_id == user_id,
     ))).scalars().all()
+    existing_by_id = {item.id: item for item in existing}
+    existing_keys = {item.canonical_key for item in existing}
     file_rows = {row["id"]: row for row in files.read_tracker(user_id)}
-    file_keys = set()
-    for row in file_rows.values():
-        payload = files.read_application(user_id, row["id"])
-        if payload:
-            file_keys.add(payload["canonical_key"])
+    payloads = {row_id: files.read_application(user_id, row_id, row=row)
+                for row_id, row in file_rows.items()}
+    file_keys = {payload["canonical_key"] for payload in payloads.values() if payload}
     if not files.migration_complete(user_id):
         for item in existing:
             if item.id not in file_rows and item.canonical_key not in file_keys:
@@ -202,20 +202,29 @@ async def _sync_file_index(user_id: str, db: AsyncSession) -> None:
                 # removed by the user after migration has completed.
                 files.write_application(user_id, _file_item(item))
         files.mark_migration_complete(user_id)
-    for row in files.read_tracker(user_id):
-        payload = files.read_application(user_id, row["id"])
+        file_rows = {row["id"]: row for row in files.read_tracker(user_id)}
+    for row in file_rows.values():
+        payload = files.read_application(user_id, row["id"], row=row)
         if payload is None:
             continue
-        item = next((candidate for candidate in existing if candidate.id == row["id"]), None)
+        item = existing_by_id.get(row["id"])
         if item is None:
             # A native career-ops row can coincide with an older DB record.
-            # Keep the original API identity and do not create a duplicate.
-            if any(candidate.canonical_key == payload["canonical_key"] for candidate in existing):
-                continue
-            item = CareerApplication(user_id=user_id, id=row["id"])
-            db.add(item)
-            existing.append(item)
-            changed = True
+            # Bind the native row to its existing API identity in the file,
+            # retaining the native tracker fields as the source of truth.
+            if payload["canonical_key"] in existing_keys:
+                item = next(candidate for candidate in existing_by_id.values()
+                            if candidate.canonical_key == payload["canonical_key"])
+                payload["id"] = item.id
+                payload["location"] = payload["location"] or item.location
+                payload["sources"] = sorted(set(payload["sources"]) | set(item.sources or []))
+                files.write_application(user_id, payload, adopt_native_id=row["id"])
+            else:
+                item = CareerApplication(user_id=user_id, id=row["id"])
+                db.add(item)
+                existing_by_id[item.id] = item
+                existing_keys.add(payload["canonical_key"])
+                changed = True
         for key in ("canonical_key", "company", "role", "location", "job_url", "stage",
                     "fit_score", "score_kind", "sources", "notes"):
             if getattr(item, key, None) != payload[key]:
