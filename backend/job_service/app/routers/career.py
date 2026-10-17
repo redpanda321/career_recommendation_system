@@ -71,6 +71,7 @@ class ApplicationIn(BaseModel):
     job_url: str | None = None
     stage: str = "saved"
     fit_score: float | None = Field(default=None, ge=0, le=100)
+    score_kind: str = Field(default="unverified", pattern="^(unverified|resume_overlap|career_ops_import|career_ops_evaluation)$")
     sources: list[str] = Field(default_factory=list, max_length=5)
     notes: list[str] = Field(default_factory=list, max_length=20)
 
@@ -141,7 +142,8 @@ def _application_out(
     return {
         "id": item.id, "company": item.company, "role": item.role,
         "location": item.location, "job_url": item.job_url, "stage": item.stage,
-        "fit_score": item.fit_score, "sources": item.sources, "notes": item.notes,
+        "fit_score": item.fit_score, "score_kind": item.score_kind,
+        "sources": item.sources, "notes": item.notes,
         "created_at": item.created_at, "updated_at": item.updated_at,
         "submission_blocked": blocking_attempt is not None,
         "blocking_attempt_id": blocking_attempt[0] if blocking_attempt else None,
@@ -477,6 +479,12 @@ async def upsert_application(
 ):
     if body.stage not in STAGES or not set(body.sources).issubset(SOURCE_NAMES):
         raise HTTPException(400, "Invalid stage or source")
+    if body.score_kind == "career_ops_evaluation" and (
+        "career-ops" not in body.sources or body.fit_score is None
+    ):
+        raise HTTPException(400, "A career-ops evaluation requires its source and score")
+    if body.score_kind == "career_ops_import" and "career-ops" not in body.sources:
+        raise HTTPException(400, "An imported score requires its career-ops source")
     try:
         url = canonical_url(body.job_url) if body.job_url else None
     except ValueError as exc:
@@ -491,7 +499,8 @@ async def upsert_application(
         row = CareerApplication(
             user_id=user_id, canonical_key=key, company=body.company.strip(), role=body.role.strip(),
             location=body.location, job_url=url, stage=body.stage, fit_score=body.fit_score,
-            sources=sorted(set(body.sources)), notes=list(dict.fromkeys(body.notes)),
+            score_kind=body.score_kind, sources=sorted(set(body.sources)),
+            notes=list(dict.fromkeys(body.notes)),
         )
         db.add(row)
     else:
@@ -501,8 +510,19 @@ async def upsert_application(
                     "interview": 5, "offer": 6, "accepted": 7, "closed": 8}
         if priority[body.stage] > priority[row.stage]:
             row.stage = body.stage
-        if body.fit_score is not None:
+        # A career-ops global evaluation supersedes a preliminary resume
+        # overlap score, including when the evaluation is less favorable or
+        # the imported tracker has no score. A later search-only sync must not
+        # silently restore that old score.
+        if body.score_kind == "career_ops_evaluation":
+            row.fit_score = body.fit_score
+            row.score_kind = body.score_kind
+        elif body.score_kind == "career_ops_import" and row.score_kind != "career_ops_evaluation":
+            row.fit_score = body.fit_score
+            row.score_kind = body.score_kind
+        elif body.fit_score is not None and row.score_kind not in {"career_ops_evaluation", "career_ops_import"}:
             row.fit_score = max(row.fit_score or 0, body.fit_score)
+            row.score_kind = body.score_kind
     try:
         await db.commit()
     except IntegrityError as exc:
@@ -616,7 +636,10 @@ async def queue_submission(
         raise HTTPException(403, "Job site is outside the authorization")
     if policy.mode == "confirm_each" and policy.application_id != application_id:
         raise HTTPException(403, "Authorization is for another application")
-    if policy.mode == "auto" and (application.fit_score is None or application.fit_score < policy.min_fit_score):
+    if policy.mode == "auto" and (
+        application.score_kind != "career_ops_evaluation"
+        or application.fit_score is None or application.fit_score < policy.min_fit_score
+    ):
         raise HTTPException(403, "Job does not meet the authorized fit threshold")
     blocking_attempt = (await db.execute(select(SubmissionAttempt.id).where(
         SubmissionAttempt.user_id == user_id,

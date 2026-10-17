@@ -10,8 +10,10 @@ os.environ.setdefault("SECRET_KEY", "test-career-bridge-secret")
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from jose import jwt
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.database import AsyncSessionLocal, Base, engine
+from app.database import ensure_career_score_kind
 from app.models import (
     CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
@@ -180,6 +182,28 @@ def test_confirmed_contact_is_separate_from_draft_and_drives_reminder():
         assert client.get(f"/career-workspace/applications/{case['id']}/activity", headers=headers(51)).status_code == 404
 
 
+def test_legacy_scores_are_unverified_after_schema_upgrade():
+    async def check():
+        old_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with old_engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "CREATE TABLE career_applications (id VARCHAR PRIMARY KEY, fit_score FLOAT)"
+                )
+                await connection.exec_driver_sql(
+                    "INSERT INTO career_applications (id, fit_score) VALUES ('legacy', 95)"
+                )
+                await ensure_career_score_kind(connection)
+                await ensure_career_score_kind(connection)
+                row = (await connection.exec_driver_sql(
+                    "SELECT fit_score, score_kind FROM career_applications WHERE id = 'legacy'"
+                )).one()
+                assert row == (95, "unverified")
+        finally:
+            await old_engine.dispose()
+    asyncio.run(check())
+
+
 def test_one_job_confirmation_and_bounded_auto_authorization():
     with TestClient(app) as client:
         case = client.post("/career-workspace/applications", json={
@@ -239,8 +263,44 @@ def test_auto_campaign_is_site_scoped_bounded_and_revocable():
             json={"authorization_id": policy["id"], "idempotency_key": "other-site-999"},
             headers=headers(3),
         ).status_code == 403
+        endpoint = f"/career-workspace/applications/{allowed['id']}/submission-attempts"
+        assert client.post(endpoint, json={
+            "authorization_id": policy["id"], "idempotency_key": "preliminary-score-999",
+        }, headers=headers(3)).status_code == 403
+        imported = client.post("/career-workspace/applications", json={
+            "company": "North", "role": "Engineer", "fit_score": 99,
+            "score_kind": "career_ops_import",
+            "job_url": "https://www.linkedin.com/jobs/view/999", "sources": ["career-ops"],
+        }, headers=headers(3)).json()
+        assert imported["fit_score"] == 99
+        assert client.post(endpoint, json={
+            "authorization_id": policy["id"], "idempotency_key": "imported-score-999",
+        }, headers=headers(3)).status_code == 403
+        evaluated = client.post("/career-workspace/applications", json={
+            "company": "North", "role": "Engineer", "fit_score": 70,
+            "score_kind": "career_ops_evaluation",
+            "job_url": "https://www.linkedin.com/jobs/view/999", "sources": ["career-ops"],
+        }, headers=headers(3)).json()
+        assert evaluated["id"] == allowed["id"]
+        assert evaluated["fit_score"] == 70
+        preliminary_resync = client.post("/career-workspace/applications", json={
+            "company": "North", "role": "Engineer", "fit_score": 100,
+            "score_kind": "resume_overlap",
+            "job_url": "https://www.linkedin.com/jobs/view/999", "sources": ["career-compass"],
+        }, headers=headers(3)).json()
+        assert preliminary_resync["fit_score"] == 70
+        assert preliminary_resync["score_kind"] == "career_ops_evaluation"
+        assert client.post(endpoint, json={
+            "authorization_id": policy["id"], "idempotency_key": "low-evaluation-999",
+        }, headers=headers(3)).status_code == 403
+        evaluated = client.post("/career-workspace/applications", json={
+            "company": "North", "role": "Engineer", "fit_score": 95,
+            "score_kind": "career_ops_evaluation",
+            "job_url": "https://www.linkedin.com/jobs/view/999", "sources": ["career-ops"],
+        }, headers=headers(3)).json()
+        assert evaluated["fit_score"] == 95
         attempt = client.post(
-            f"/career-workspace/applications/{allowed['id']}/submission-attempts",
+            endpoint,
             json={"authorization_id": policy["id"], "idempotency_key": "allowed-site-999"},
             headers=headers(3),
         )

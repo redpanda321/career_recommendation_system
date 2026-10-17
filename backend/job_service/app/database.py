@@ -20,6 +20,7 @@ async def create_db_and_tables():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await ensure_submission_worker_columns(conn)
+        await ensure_career_score_kind(conn)
 
 
 async def ensure_submission_worker_columns(conn):
@@ -39,6 +40,19 @@ async def ensure_submission_worker_columns(conn):
             await conn.exec_driver_sql(
                 f"ALTER TABLE submission_attempts ADD COLUMN {optional}{name} {kind}"
             )
+
+
+async def ensure_career_score_kind(conn):
+    """Mark historical scores unverified; legacy resume overlap is not an evaluation."""
+    columns = await conn.run_sync(lambda sync_conn: {
+        column["name"] for column in inspect(sync_conn).get_columns("career_applications")
+    })
+    if "score_kind" not in columns:
+        optional = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
+        await conn.exec_driver_sql(
+            "ALTER TABLE career_applications ADD COLUMN "
+            f"{optional}score_kind VARCHAR(32) NOT NULL DEFAULT 'unverified'"
+        )
 
 # Dependency for FastAPI routes
 async def get_db():
