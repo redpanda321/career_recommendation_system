@@ -37,6 +37,17 @@ result to the selected application. Saving research neither changes the stage
 or score nor queues a submission. Drafting adapters may use it as unverified,
 candidate-supplied context; automatic Eigent outcome sync is not implemented.
 
+Hanggent may additionally save a `research_task_link` artifact containing only
+opaque Eigent project/task IDs after verifying a saved task belongs to the
+signed-in owner. The canonical store versions this metadata with the same
+per-application isolation as other artifacts. It is not a task transcript,
+verified company research, or permission to submit an application. Any future
+task-outcome reader must recheck ownership instead of trusting stored IDs.
+For saved legacy tasks, Hanggent can preview a completed task summary only
+after this ownership check and a matching link. The summary is not saved as
+research until the candidate reviews its sources and confirms a separate
+artifact write.
+
 Submission modes share one durable policy model:
 
 - `confirm_each` authorizes exactly one application and one allowed site.

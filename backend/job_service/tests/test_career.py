@@ -175,6 +175,24 @@ def test_reviewed_research_is_versioned_and_does_not_change_application():
         assert unchanged["fit_score"] is None
 
 
+def test_research_task_link_metadata_is_owner_scoped_and_versioned():
+    with TestClient(app) as client:
+        application = client.post("/career-workspace/applications", headers=headers(63), json={
+            "company": "Task Link Co", "role": "Engineer", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{application['id']}/artifacts"
+        body = {"kind": "research_task_link", "source": "hanggent",
+                "content_markdown": '{"project_id":"project-1","task_id":"task-1"}'}
+        assert client.post(endpoint, headers=headers(64), json=body).status_code == 404
+        response = client.post(endpoint, headers=headers(63), json=body)
+        assert response.status_code == 200, response.text
+        assert response.json()["version"] == 1
+        activity = client.get(f"{endpoint[:-10]}/activity", headers=headers(63)).json()
+        assert activity["artifacts"][0]["content_markdown"] == body["content_markdown"]
+        assert activity["submission_attempts"] == []
+        assert client.get(f"{endpoint[:-10]}", headers=headers(63)).json()["stage"] == "saved"
+
+
 def test_profile_and_feedback_are_candidate_scoped_and_auditable():
     with TestClient(app) as client:
         assert client.get("/career-workspace/profile", headers=headers(41)).json()["full_name"] == ""

@@ -105,7 +105,7 @@ class ContactIn(BaseModel):
 
 
 class ArtifactIn(BaseModel):
-    kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|research|interview_prep|followup|offer_prep)$")
+    kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|research|research_task_link|interview_prep|followup|offer_prep)$")
     source: str = Field(pattern="^(career-compass|career-ops|ai-job-search|proficiently|hanggent)$")
     content_markdown: str = Field(min_length=1, max_length=100000)
 
