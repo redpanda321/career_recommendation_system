@@ -112,6 +112,12 @@ def test_profile_and_feedback_are_candidate_scoped_and_auditable():
         case = client.post("/career-workspace/applications", headers=headers(41), json={
             "company": "Example", "role": "Engineer", "sources": ["career-ops"],
         }).json()
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(41)
+        ).json()["company"] == "Example"
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(42)
+        ).status_code == 404
         endpoint = f"/career-workspace/applications/{case['id']}/feedback"
         assert client.post(endpoint, headers=headers(42), json={
             "stage": "interview", "note": "Employer invited me",
@@ -127,6 +133,13 @@ def test_profile_and_feedback_are_candidate_scoped_and_auditable():
         assert events[-1]["from_stage"] == "saved"
         assert events[-1]["to_stage"] == "interview"
         assert events[-1]["note"] == "Employer invited me"
+        drafted = client.post(
+            f"/career-workspace/applications/{case['id']}/artifacts",
+            headers=headers(41), json={
+                "kind": "followup", "source": "hanggent", "content_markdown": "Dear recruiter, ...",
+            },
+        )
+        assert drafted.status_code == 200, drafted.text
 
 
 def test_one_job_confirmation_and_bounded_auto_authorization():

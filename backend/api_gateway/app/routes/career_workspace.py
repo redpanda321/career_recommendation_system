@@ -248,6 +248,11 @@ async def save_canonical_application(request: Request, _user: str = Depends(care
     return await _forward(request, "applications", "POST", await request.json())
 
 
+@router.get("/applications/{application_id}")
+async def get_canonical_application(application_id: str, request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, f"applications/{application_id}", "GET")
+
+
 @router.get("/applications/{application_id}/activity")
 async def canonical_application_activity(application_id: str, request: Request, _user: str = Depends(career_user)):
     return await _forward(request, f"applications/{application_id}/activity", "GET")

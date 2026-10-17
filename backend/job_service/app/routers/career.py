@@ -90,7 +90,7 @@ class StageFeedbackIn(BaseModel):
 
 
 class ArtifactIn(BaseModel):
-    kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|interview_prep)$")
+    kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|interview_prep|followup|offer_prep)$")
     source: str = Field(pattern="^(career-compass|career-ops|ai-job-search|proficiently|hanggent)$")
     content_markdown: str = Field(min_length=1, max_length=100000)
 
@@ -133,6 +133,7 @@ def _application_out(
         "id": item.id, "company": item.company, "role": item.role,
         "location": item.location, "job_url": item.job_url, "stage": item.stage,
         "fit_score": item.fit_score, "sources": item.sources, "notes": item.notes,
+        "created_at": item.created_at, "updated_at": item.updated_at,
         "submission_blocked": blocking_attempt is not None,
         "blocking_attempt_id": blocking_attempt[0] if blocking_attempt else None,
         "blocking_attempt_status": blocking_attempt[1] if blocking_attempt else None,
@@ -198,6 +199,7 @@ async def record_candidate_feedback(
     application.stage = body.stage
     db.add(event)
     await db.commit()
+    await db.refresh(application)
     return {"application": _application_out(application), "event_id": event.id,
             "external_submission": "candidate_reported" if body.stage == "applied" else "not_claimed"}
 
@@ -392,6 +394,19 @@ async def list_applications(user_id: str = Depends(career_user), db: AsyncSessio
     for application_id, attempt_id, status in blocked_rows:
         blocked.setdefault(application_id, (attempt_id, status))
     return [_application_out(row, blocking_attempt=blocked.get(row.id)) for row in rows]
+
+
+@router.get("/applications/{application_id}")
+async def get_application(
+    application_id: str, user_id: str = Depends(career_user),
+    db: AsyncSession = Depends(get_db),
+):
+    row = (await db.execute(select(CareerApplication).where(
+        CareerApplication.id == application_id, CareerApplication.user_id == user_id,
+    ))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, "Application not found")
+    return _application_out(row)
 
 
 @router.post("/applications")
