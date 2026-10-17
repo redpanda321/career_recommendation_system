@@ -30,6 +30,13 @@ Rows are deduplicated by normalized public job URL, or by company/role/location 
 no URL is available. A URL-bearing record and a URL-less record are not assumed to
 be identical.
 
+Candidate-reviewed job research is stored as versioned `research` artifacts on
+the canonical application row. Hanggent may hand a role to Eigent as an unsent
+research draft, but the candidate must review sources and explicitly save the
+result to the selected application. Saving research neither changes the stage
+or score nor queues a submission. Drafting adapters may use it as unverified,
+candidate-supplied context; automatic Eigent outcome sync is not implemented.
+
 Submission modes share one durable policy model:
 
 - `confirm_each` authorizes exactly one application and one allowed site.

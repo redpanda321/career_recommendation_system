@@ -152,6 +152,29 @@ def test_applications_are_idempotent_and_user_isolated():
         assert len(activity["artifacts"]) == 1
 
 
+def test_reviewed_research_is_versioned_and_does_not_change_application():
+    with TestClient(app) as client:
+        application = client.post("/career-workspace/applications", headers=headers(61), json={
+            "company": "Research Co", "role": "Engineer", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{application['id']}/artifacts"
+        body = {"kind": "research", "source": "hanggent", "content_markdown": "# Reviewed job research\nSource: company website"}
+        assert client.post(endpoint, headers=headers(62), json=body).status_code == 404
+        first = client.post(endpoint, headers=headers(61), json=body)
+        second = client.post(endpoint, headers=headers(61), json={
+            **body, "content_markdown": "# Corrected research\nSource: company website",
+        })
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert (first.json()["version"], second.json()["version"]) == (1, 2)
+        activity = client.get(f"{endpoint[:-10]}/activity", headers=headers(61)).json()
+        assert sorted(artifact["version"] for artifact in activity["artifacts"] if artifact["kind"] == "research") == [1, 2]
+        assert activity["submission_attempts"] == []
+        unchanged = client.get(f"{endpoint[:-10]}", headers=headers(61)).json()
+        assert unchanged["stage"] == "saved"
+        assert unchanged["fit_score"] is None
+
+
 def test_profile_and_feedback_are_candidate_scoped_and_auditable():
     with TestClient(app) as client:
         assert client.get("/career-workspace/profile", headers=headers(41)).json()["full_name"] == ""
