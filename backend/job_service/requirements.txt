@@ -10,3 +10,4 @@ python-dotenv==1.0.0
 asyncpg==0.29.0 
 python-multipart
 python-jose
+PyYAML==6.0.2

@@ -19,6 +19,9 @@ from app.models import (
     SubmissionAuthorization, SubmissionAttempt,
 )
 from app.routers.career import router
+from app import career_ops_files
+import yaml
+import pytest
 
 
 app = FastAPI()
@@ -455,3 +458,116 @@ def test_expired_worker_lease_requires_manual_verification():
             "receipt_url": "https://jobs.lever.co/lease/111/receipt",
             "confirmation_text": "Application submitted",
         }, headers=headers(12)).status_code == 409
+
+
+def test_file_first_workspace_round_trip_and_native_tracker(monkeypatch, tmp_path):
+    monkeypatch.setenv("CAREER_OPS_DATA_ROOT", str(tmp_path / "private-career-ops"))
+    with TestClient(app) as client:
+        saved = client.put("/career-workspace/profile", headers=headers(9001), json={
+            "full_name": "Alex Example", "resume_markdown": "# Alex CV",
+        })
+        assert saved.status_code == 200, saved.text
+        base = career_ops_files.workspace("9001")
+        assert (base / "cv.md").read_text(encoding="utf-8") == "# Alex CV"
+        assert client.get("/career-workspace/profile", headers=headers(9002)).json()["full_name"] == ""
+        queued = client.post("/career-workspace/pipeline", headers=headers(9001), json={
+            "job_url": "https://jobs.example.com/northwind/1", "company": "Northwind",
+            "role": "Platform Engineer",
+        })
+        assert queued.status_code == 200, queued.text
+        assert len(client.get("/career-workspace/pipeline", headers=headers(9001)).json()) == 1
+        assert client.get("/career-workspace/pipeline", headers=headers(9002)).json() == []
+
+        created = client.post("/career-workspace/applications", headers=headers(9001), json={
+            "company": "Northwind", "role": "Platform Engineer",
+            "job_url": "https://jobs.example.com/northwind/1", "stage": "saved",
+            "fit_score": 82, "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
+        })
+        assert created.status_code == 200, created.text
+        application_id = created.json()["id"]
+        tracker = (base / "data/applications.md").read_text(encoding="utf-8")
+        assert "4.1/5" in tracker and "Evaluated" in tracker
+        assert f"[hanggent-id:{application_id}]" in tracker
+        assert client.get("/career-workspace/pipeline", headers=headers(9001)).json()[0]["status"] == "processed"
+        assert client.get("/career-workspace/applications", headers=headers(9002)).json() == []
+
+        feedback = client.post(f"/career-workspace/applications/{application_id}/feedback",
+                               headers=headers(9001), json={"stage": "applied", "note": "I sent this myself"})
+        assert feedback.status_code == 200, feedback.text
+        assert "\tEvaluated\tApplied\tweb\t" in (base / "data/status-log.tsv").read_text(encoding="utf-8")
+        artifact = client.post(f"/career-workspace/applications/{application_id}/artifacts",
+                               headers=headers(9001), json={
+                                   "kind": "cover_letter", "source": "career-ops",
+                                   "content_markdown": "# Reviewed letter",
+                               })
+        assert artifact.status_code == 200, artifact.text
+        assert list((base / "reports").glob("*.md"))[0].read_text(encoding="utf-8") == "# Reviewed letter"
+        evaluation = client.post(f"/career-workspace/applications/{application_id}/artifacts",
+                                 headers=headers(9001), json={
+                                     "kind": "evaluation", "source": "career-ops",
+                                     "content_markdown": "# Fit report",
+                                 })
+        assert evaluation.status_code == 200, evaluation.text
+        assert "../reports/" in (base / "data/applications.md").read_text(encoding="utf-8")
+
+        # An out-of-band career-ops edit is authoritative over the DB index.
+        path = base / "data/applications.md"
+        path.write_text(path.read_text(encoding="utf-8").replace("| Applied |", "| Interview |")
+                        .replace("| 4.1/5 |", "| 4.9/5 |"), encoding="utf-8")
+        fetched = client.get(f"/career-workspace/applications/{application_id}", headers=headers(9001))
+        assert fetched.status_code == 200 and fetched.json()["stage"] == "interview"
+        assert fetched.json()["fit_score"] == 98
+        assert fetched.json()["score_kind"] == "career_ops_import"
+
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write("| 2 | 2026-10-17 | Example Corp | Analyst | 4.5/5 | Applied | ❌ | — | Native entry | https://jobs.example.com/2 |\n")
+        listing = client.get("/career-workspace/applications", headers=headers(9001))
+        assert listing.status_code == 200, listing.text
+        assert any(item["company"] == "Example Corp" and item["score_kind"] == "career_ops_import"
+                   for item in listing.json())
+        native_id = next(item["id"] for item in listing.json() if item["company"] == "Example Corp")
+        path.write_text("\n".join(line for line in path.read_text(encoding="utf-8").splitlines()
+                                  if "Example Corp" not in line) + "\n", encoding="utf-8")
+        assert all(item["id"] != native_id for item in client.get(
+            "/career-workspace/applications", headers=headers(9001)).json())
+        assert client.get(f"/career-workspace/applications/{native_id}", headers=headers(9001)).status_code == 404
+    assert not (career_ops_files.workspace("9002") / "data/applications.md").exists()
+
+
+def test_file_workspace_preserves_native_rows_and_profile_fields(monkeypatch, tmp_path):
+    monkeypatch.setenv("CAREER_OPS_DATA_ROOT", str(tmp_path / "private"))
+    user = "native-user"
+    base = career_ops_files.workspace(user)
+    (base / "data").mkdir(parents=True)
+    tracker = base / "data/applications.md"
+    tracker.write_text(
+        "# Applications Tracker\n\n" + career_ops_files.HEADER + "\n"
+        + career_ops_files.SEPARATOR + "\n"
+        + "| 7 | 2026-10-17 | Acme | Engineer | 4.3/5 | Applied | ❌ | — | Legacy note | https://jobs.example.com/7 |\n",
+        encoding="utf-8",
+    )
+    row = career_ops_files.read_tracker(user)[0]
+    assert row["#"] == "7"
+    payload = career_ops_files.read_application(user, row["id"])
+    payload["stage"] = "interview"
+    career_ops_files.write_application(user, payload)
+    rows = career_ops_files.read_tracker(user)
+    assert len(rows) == 1 and rows[0]["#"] == "7" and rows[0]["Status"] == "Interview"
+    assert "Legacy note" in rows[0]["Notes"]
+
+    config = base / "config/profile.yml"
+    config.parent.mkdir()
+    config.write_text("candidate:\n  email: alex@example.com\ncompensation:\n  currency: USD\n", encoding="utf-8")
+    career_ops_files.write_profile(user, {
+        "full_name": "Alex", "headline": "Engineer", "location": "Remote",
+        "target_roles": ["Engineer"], "skills": ["Python"], "resume_markdown": "# CV",
+    })
+    document = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert document["candidate"]["email"] == "alex@example.com"
+    assert document["compensation"]["currency"] == "USD"
+    assert career_ops_files.read_profile(user)["skills"] == ["Python"]
+    with pytest.raises(RuntimeError, match="escapes user directory"):
+        career_ops_files.read_artifact(user, "../../outside")
+    monkeypatch.setenv("CAREER_OPS_DATA_ROOT", "relative-workspace")
+    with pytest.raises(RuntimeError, match="must be absolute"):
+        career_ops_files.configured_root()
