@@ -281,3 +281,23 @@ async def revoke_submission_authorization(authorization_id: str, request: Reques
 @router.post("/applications/{application_id}/submission-attempts")
 async def create_submission_attempt(application_id: str, request: Request, _user: str = Depends(career_user)):
     return await _forward(request, f"applications/{application_id}/submission-attempts", "POST", await request.json())
+
+
+@router.get("/submission-attempts/{attempt_id}")
+async def get_submission_attempt(attempt_id: str, request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, f"submission-attempts/{attempt_id}", "GET")
+
+
+@router.post("/submission-attempts/{attempt_id}/claim")
+async def claim_submission_attempt(attempt_id: str, request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, f"submission-attempts/{attempt_id}/claim", "POST", await request.json())
+
+
+@router.post("/submission-attempts/{attempt_id}/finish")
+async def finish_submission_attempt(attempt_id: str, request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, f"submission-attempts/{attempt_id}/finish", "POST", await request.json())
+
+
+@router.post("/submission-attempts/{attempt_id}/resolve")
+async def resolve_uncertain_attempt(attempt_id: str, request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, f"submission-attempts/{attempt_id}/resolve", "POST", await request.json())

@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from jose import jwt
 
-from app.database import Base, engine
+from app.database import AsyncSessionLocal, Base, engine
 from app.models import CareerApplication, CareerArtifact, SubmissionAuthorization, SubmissionAttempt
 from app.routers.career import router
 
@@ -166,3 +166,143 @@ def test_auto_campaign_is_site_scoped_bounded_and_revocable():
         assert client.post(
             f"/career-workspace/authorizations/{policy['id']}/revoke", headers=headers(3)
         ).status_code == 200
+
+
+def test_worker_claim_and_verified_receipt_are_user_scoped():
+    with TestClient(app) as client:
+        job = client.post("/career-workspace/applications", json={
+            "company": "Field", "role": "Analyst", "fit_score": 94,
+            "job_url": "https://boards.greenhouse.io/field/jobs/321",
+            "sources": ["career-compass"],
+        }, headers=headers(8)).json()
+        policy = client.post("/career-workspace/authorizations", json={
+            "mode": "confirm_each", "application_id": job["id"],
+            "allowed_sites": ["greenhouse"], "max_applications": 1,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        }, headers=headers(8)).json()
+        attempt = client.post(
+            f"/career-workspace/applications/{job['id']}/submission-attempts",
+            json={"authorization_id": policy["id"], "idempotency_key": "field-analyst-321"},
+            headers=headers(8),
+        ).json()
+        endpoint = f"/career-workspace/submission-attempts/{attempt['id']}"
+        assert client.get(endpoint, headers=headers(9)).status_code == 404
+        assert client.post(endpoint + "/claim", json={
+            "browser_session_id": "owned-browser-8",
+        }, headers=headers(9)).status_code == 404
+        claimed = client.post(endpoint + "/claim", json={
+            "browser_session_id": "owned-browser-8",
+        }, headers=headers(8))
+        assert claimed.status_code == 200, claimed.text
+        token = claimed.json()["claim_token"]
+        assert client.post(endpoint + "/claim", json={
+            "browser_session_id": "second-browser",
+        }, headers=headers(8)).status_code == 409
+        assert client.post(endpoint + "/finish", json={
+            "claim_token": token, "status": "submitted",
+            "receipt_url": "https://evil.example/receipt",
+            "confirmation_text": "Application submitted",
+        }, headers=headers(8)).status_code == 400
+        result = client.post(endpoint + "/finish", json={
+            "claim_token": token, "status": "submitted",
+            "receipt_url": "https://boards.greenhouse.io/field/jobs/321/confirmation",
+            "confirmation_text": "Thank you for applying",
+        }, headers=headers(8))
+        assert result.status_code == 200, result.text
+        assert result.json()["external_submission"] == "verified"
+        assert client.get(endpoint, headers=headers(8)).json()["status"] == "submitted"
+        tracked = client.get("/career-workspace/applications", headers=headers(8)).json()[-1]
+        assert tracked["stage"] == "applied"
+        assert tracked["submission_blocked"] is True
+        next_policy = client.post("/career-workspace/authorizations", json={
+            "mode": "confirm_each", "application_id": job["id"],
+            "allowed_sites": ["greenhouse"], "max_applications": 1,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        }, headers=headers(8)).json()
+        assert client.post(
+            f"/career-workspace/applications/{job['id']}/submission-attempts",
+            json={"authorization_id": next_policy["id"], "idempotency_key": "duplicate-field-321"},
+            headers=headers(8),
+        ).status_code == 409
+
+
+def test_uncertain_attempt_requires_candidate_resolution_before_retry():
+    with TestClient(app) as client:
+        job = client.post("/career-workspace/applications", json={
+            "company": "Maybe", "role": "Designer", "fit_score": 92,
+            "job_url": "https://jobs.lever.co/maybe/555", "sources": ["career-compass"],
+        }, headers=headers(10)).json()
+        expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        def authorize():
+            return client.post("/career-workspace/authorizations", json={
+                "mode": "confirm_each", "application_id": job["id"],
+                "allowed_sites": ["lever"], "max_applications": 1, "expires_at": expires,
+            }, headers=headers(10)).json()["id"]
+        first_policy = authorize()
+        endpoint = f"/career-workspace/applications/{job['id']}/submission-attempts"
+        attempt = client.post(endpoint, json={
+            "authorization_id": first_policy, "idempotency_key": "maybe-designer-555",
+        }, headers=headers(10)).json()
+        attempt_url = f"/career-workspace/submission-attempts/{attempt['id']}"
+        token = client.post(attempt_url + "/claim", json={
+            "browser_session_id": "owned-browser-10",
+        }, headers=headers(10)).json()["claim_token"]
+        assert client.post(attempt_url + "/finish", json={
+            "claim_token": token, "status": "uncertain",
+            "reason": "Submit was clicked but no receipt appeared",
+        }, headers=headers(10)).status_code == 200
+        tracked = client.get("/career-workspace/applications", headers=headers(10)).json()[-1]
+        assert tracked["blocking_attempt_status"] == "uncertain"
+        next_policy = authorize()
+        assert client.post(endpoint, json={
+            "authorization_id": next_policy, "idempotency_key": "retry-designer-555",
+        }, headers=headers(10)).status_code == 409
+        assert client.post(attempt_url + "/resolve", json={
+            "confirmed_not_submitted": False, "note": "Checked my account and email",
+        }, headers=headers(10)).status_code == 409
+        assert client.post(attempt_url + "/resolve", json={
+            "confirmed_not_submitted": True, "note": "Checked my account and email",
+        }, headers=headers(11)).status_code == 404
+        assert client.post(attempt_url + "/resolve", json={
+            "confirmed_not_submitted": True, "note": "Checked my account and email",
+        }, headers=headers(10)).status_code == 200
+        assert client.post(endpoint, json={
+            "authorization_id": next_policy, "idempotency_key": "retry-designer-555",
+        }, headers=headers(10)).status_code == 200
+
+
+def test_expired_worker_lease_requires_manual_verification():
+    with TestClient(app) as client:
+        job = client.post("/career-workspace/applications", json={
+            "company": "Lease", "role": "Tester", "fit_score": 90,
+            "job_url": "https://jobs.lever.co/lease/111", "sources": ["career-compass"],
+        }, headers=headers(12)).json()
+        policy = client.post("/career-workspace/authorizations", json={
+            "mode": "confirm_each", "application_id": job["id"],
+            "allowed_sites": ["lever"], "max_applications": 1,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        }, headers=headers(12)).json()
+        attempt = client.post(
+            f"/career-workspace/applications/{job['id']}/submission-attempts",
+            json={"authorization_id": policy["id"], "idempotency_key": "lease-tester-111"},
+            headers=headers(12),
+        ).json()
+        attempt_url = f"/career-workspace/submission-attempts/{attempt['id']}"
+        claimed = client.post(attempt_url + "/claim", json={
+            "browser_session_id": "owned-browser-12",
+        }, headers=headers(12)).json()
+
+        async def expire_lease():
+            async with AsyncSessionLocal() as db:
+                row = await db.get(SubmissionAttempt, attempt["id"])
+                row.lease_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+                await db.commit()
+        asyncio.run(expire_lease())
+
+        tracked = client.get("/career-workspace/applications", headers=headers(12)).json()[-1]
+        assert tracked["blocking_attempt_status"] == "uncertain"
+        assert client.post(attempt_url + "/finish", json={
+            "claim_token": claimed["claim_token"], "status": "submitted",
+            "receipt_url": "https://jobs.lever.co/lease/111/receipt",
+            "confirmation_text": "Application submitted",
+        }, headers=headers(12)).status_code == 409

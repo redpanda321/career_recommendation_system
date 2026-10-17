@@ -5,6 +5,8 @@ until a separate, authenticated browser worker records a verified outcome.
 """
 
 from datetime import datetime, timedelta, timezone
+import hashlib
+import secrets
 from ipaddress import ip_address
 from urllib.parse import urlsplit, urlunsplit
 
@@ -90,12 +92,166 @@ class AttemptIn(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=120)
 
 
-def _application_out(item: CareerApplication) -> dict:
+class ClaimIn(BaseModel):
+    browser_session_id: str = Field(min_length=1, max_length=100)
+
+
+class FinishIn(BaseModel):
+    claim_token: str = Field(min_length=40, max_length=100)
+    status: str = Field(pattern="^(submitted|needs_user|failed|uncertain)$")
+    receipt_url: str | None = None
+    confirmation_text: str | None = Field(default=None, max_length=500)
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class ResolveIn(BaseModel):
+    confirmed_not_submitted: bool
+    note: str = Field(min_length=10, max_length=500)
+
+
+def _application_out(
+    item: CareerApplication, *, blocking_attempt: tuple[str, str] | None = None,
+) -> dict:
     return {
         "id": item.id, "company": item.company, "role": item.role,
         "location": item.location, "job_url": item.job_url, "stage": item.stage,
         "fit_score": item.fit_score, "sources": item.sources, "notes": item.notes,
+        "submission_blocked": blocking_attempt is not None,
+        "blocking_attempt_id": blocking_attempt[0] if blocking_attempt else None,
+        "blocking_attempt_status": blocking_attempt[1] if blocking_attempt else None,
     }
+
+
+def _expiry(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+@router.get("/submission-attempts/{attempt_id}")
+async def get_submission_attempt(
+    attempt_id: str, user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    attempt = (await db.execute(select(SubmissionAttempt).where(
+        SubmissionAttempt.id == attempt_id, SubmissionAttempt.user_id == user_id,
+    ))).scalar_one_or_none()
+    if attempt is None:
+        raise HTTPException(404, "Submission attempt not found")
+    application = (await db.execute(select(CareerApplication).where(
+        CareerApplication.id == attempt.application_id, CareerApplication.user_id == user_id,
+    ))).scalar_one()
+    policy = (await db.execute(select(SubmissionAuthorization).where(
+        SubmissionAuthorization.id == attempt.authorization_id,
+        SubmissionAuthorization.user_id == user_id,
+    ))).scalar_one()
+    return {
+        "id": attempt.id, "status": attempt.status, "site": attempt.site,
+        "job_url": application.job_url, "company": application.company,
+        "role": application.role, "mode": policy.mode,
+        "authorization_expires_at": _expiry(policy.expires_at).isoformat(),
+        "authorization_revoked": policy.revoked_at is not None,
+        "lease_until": _expiry(attempt.lease_until).isoformat() if attempt.lease_until else None,
+        "user_id": user_id,
+    }
+
+
+@router.post("/submission-attempts/{attempt_id}/claim")
+async def claim_submission_attempt(
+    attempt_id: str, body: ClaimIn, user_id: str = Depends(career_user),
+    db: AsyncSession = Depends(get_db),
+):
+    attempt = (await db.execute(select(SubmissionAttempt).where(
+        SubmissionAttempt.id == attempt_id, SubmissionAttempt.user_id == user_id,
+    ).with_for_update())).scalar_one_or_none()
+    if attempt is None:
+        raise HTTPException(404, "Submission attempt not found")
+    now = datetime.now(timezone.utc)
+    if attempt.status == "running" and attempt.lease_until and _expiry(attempt.lease_until) <= now:
+        attempt.status = "uncertain"
+        attempt.error = "Worker lease expired; external submission outcome is unknown"
+        await db.commit()
+        raise HTTPException(409, "Previous attempt outcome is uncertain; do not retry automatically")
+    if attempt.status != "queued":
+        raise HTTPException(409, "Submission attempt is not queued")
+    await db.execute(select(CareerApplication.id).where(
+        CareerApplication.id == attempt.application_id, CareerApplication.user_id == user_id,
+    ).with_for_update())
+    other_active = (await db.execute(select(SubmissionAttempt.id).where(
+        SubmissionAttempt.user_id == user_id,
+        SubmissionAttempt.application_id == attempt.application_id,
+        SubmissionAttempt.id != attempt.id,
+        SubmissionAttempt.status.in_(("running", "uncertain", "submitted")),
+    ).limit(1))).scalar_one_or_none()
+    if other_active:
+        raise HTTPException(409, "Another attempt for this application is active or unresolved")
+    policy = (await db.execute(select(SubmissionAuthorization).where(
+        SubmissionAuthorization.id == attempt.authorization_id,
+        SubmissionAuthorization.user_id == user_id,
+    ).with_for_update())).scalar_one()
+    if policy.revoked_at is not None or _expiry(policy.expires_at) <= now:
+        raise HTTPException(403, "Submission authorization is revoked or expired")
+    token = secrets.token_urlsafe(48)
+    attempt.status = "running"
+    attempt.browser_session_id = body.browser_session_id
+    attempt.claim_token_hash = hashlib.sha256(token.encode()).hexdigest()
+    attempt.lease_until = now + timedelta(minutes=10)
+    await db.commit()
+    return {"id": attempt.id, "status": "running", "claim_token": token,
+            "lease_until": attempt.lease_until.isoformat()}
+
+
+@router.post("/submission-attempts/{attempt_id}/finish")
+async def finish_submission_attempt(
+    attempt_id: str, body: FinishIn, user_id: str = Depends(career_user),
+    db: AsyncSession = Depends(get_db),
+):
+    attempt = (await db.execute(select(SubmissionAttempt).where(
+        SubmissionAttempt.id == attempt_id, SubmissionAttempt.user_id == user_id,
+    ).with_for_update())).scalar_one_or_none()
+    if attempt is None or attempt.status != "running" or not attempt.claim_token_hash:
+        raise HTTPException(409, "Submission attempt is not running")
+    digest = hashlib.sha256(body.claim_token.encode()).hexdigest()
+    if not secrets.compare_digest(digest, attempt.claim_token_hash):
+        raise HTTPException(403, "Invalid worker claim")
+    if body.status == "submitted":
+        if not body.receipt_url or site_for_url(body.receipt_url) != attempt.site:
+            raise HTTPException(400, "A receipt on the authorized site is required")
+        evidence = (body.confirmation_text or "").casefold()
+        if not any(phrase in evidence for phrase in (
+            "application submitted", "application sent", "thank you for applying",
+            "your application has been received",
+        )):
+            raise HTTPException(400, "A recognizable submission confirmation is required")
+        application = (await db.execute(select(CareerApplication).where(
+            CareerApplication.id == attempt.application_id, CareerApplication.user_id == user_id,
+        ))).scalar_one()
+        application.stage = "applied"
+        attempt.receipt = {"url": body.receipt_url, "confirmation_text": body.confirmation_text}
+    attempt.status = body.status
+    attempt.error = body.reason
+    attempt.claim_token_hash = None
+    attempt.lease_until = None
+    await db.commit()
+    return {"id": attempt.id, "status": attempt.status,
+            "external_submission": "verified" if attempt.status == "submitted" else "not_verified"}
+
+
+@router.post("/submission-attempts/{attempt_id}/resolve")
+async def resolve_uncertain_attempt(
+    attempt_id: str, body: ResolveIn, user_id: str = Depends(career_user),
+    db: AsyncSession = Depends(get_db),
+):
+    attempt = (await db.execute(select(SubmissionAttempt).where(
+        SubmissionAttempt.id == attempt_id, SubmissionAttempt.user_id == user_id,
+    ).with_for_update())).scalar_one_or_none()
+    if attempt is None:
+        raise HTTPException(404, "Submission attempt not found")
+    if attempt.status != "uncertain" or not body.confirmed_not_submitted:
+        raise HTTPException(409, "Only an uncertain attempt with explicit candidate verification can be cleared")
+    attempt.status = "not_submitted"
+    attempt.error = "Candidate verified no application was sent: " + body.note
+    attempt.claim_token_hash = None
+    attempt.lease_until = None
+    await db.commit()
+    return {"id": attempt.id, "status": attempt.status}
 
 
 @router.get("/applications/{application_id}/activity")
@@ -125,11 +281,34 @@ async def application_activity(
 
 @router.get("/applications")
 async def list_applications(user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db)):
+    # A crashed worker cannot hold a job in "running" forever. Its external
+    # outcome is unknown, so require candidate verification before another try.
+    expired = (await db.execute(select(SubmissionAttempt).where(
+        SubmissionAttempt.user_id == user_id,
+        SubmissionAttempt.status == "running",
+        SubmissionAttempt.lease_until <= datetime.now(timezone.utc),
+    ))).scalars().all()
+    for attempt in expired:
+        attempt.status = "uncertain"
+        attempt.error = "Worker lease expired; verify the employer site before retrying"
+        attempt.claim_token_hash = None
+        attempt.lease_until = None
+    if expired:
+        await db.commit()
     rows = (await db.execute(
         select(CareerApplication).where(CareerApplication.user_id == user_id)
         .order_by(CareerApplication.created_at.desc())
     )).scalars().all()
-    return [_application_out(row) for row in rows]
+    blocked_rows = (await db.execute(select(
+        SubmissionAttempt.application_id, SubmissionAttempt.id, SubmissionAttempt.status,
+    ).where(
+        SubmissionAttempt.user_id == user_id,
+        SubmissionAttempt.status.in_(("running", "uncertain", "submitted")),
+    ).order_by(SubmissionAttempt.created_at.desc()))).all()
+    blocked = {}
+    for application_id, attempt_id, status in blocked_rows:
+        blocked.setdefault(application_id, (attempt_id, status))
+    return [_application_out(row, blocking_attempt=blocked.get(row.id)) for row in rows]
 
 
 @router.post("/applications")
@@ -279,6 +458,13 @@ async def queue_submission(
         raise HTTPException(403, "Authorization is for another application")
     if policy.mode == "auto" and (application.fit_score is None or application.fit_score < policy.min_fit_score):
         raise HTTPException(403, "Job does not meet the authorized fit threshold")
+    blocking_attempt = (await db.execute(select(SubmissionAttempt.id).where(
+        SubmissionAttempt.user_id == user_id,
+        SubmissionAttempt.application_id == application_id,
+        SubmissionAttempt.status.in_(("running", "uncertain", "submitted")),
+    ).limit(1))).scalar_one_or_none()
+    if blocking_attempt:
+        raise HTTPException(409, "A running, uncertain, or submitted application must be resolved first")
     already_queued = (await db.execute(select(SubmissionAttempt.id).where(
         SubmissionAttempt.authorization_id == policy.id,
         SubmissionAttempt.application_id == application_id,
