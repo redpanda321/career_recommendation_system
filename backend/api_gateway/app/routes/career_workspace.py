@@ -233,14 +233,49 @@ async def list_canonical_applications(request: Request, _user: str = Depends(car
     return await _forward(request, "applications", "GET")
 
 
+@router.get("/pipeline")
+async def list_canonical_pipeline(request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, "pipeline", "GET")
+
+
+@router.post("/pipeline")
+async def save_canonical_pipeline_url(request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, "pipeline", "POST", await request.json())
+
+
+@router.get("/profile")
+async def get_canonical_profile(request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, "profile", "GET")
+
+
+@router.put("/profile")
+async def save_canonical_profile(request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, "profile", "PUT", await request.json())
+
+
 @router.post("/applications")
 async def save_canonical_application(request: Request, _user: str = Depends(career_user)):
     return await _forward(request, "applications", "POST", await request.json())
 
 
+@router.get("/applications/{application_id}")
+async def get_canonical_application(application_id: str, request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, f"applications/{application_id}", "GET")
+
+
 @router.get("/applications/{application_id}/activity")
 async def canonical_application_activity(application_id: str, request: Request, _user: str = Depends(career_user)):
     return await _forward(request, f"applications/{application_id}/activity", "GET")
+
+
+@router.post("/applications/{application_id}/feedback")
+async def save_canonical_feedback(application_id: str, request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, f"applications/{application_id}/feedback", "POST", await request.json())
+
+
+@router.post("/applications/{application_id}/contacts")
+async def save_canonical_contact(application_id: str, request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, f"applications/{application_id}/contacts", "POST", await request.json())
 
 
 @router.post("/import")
