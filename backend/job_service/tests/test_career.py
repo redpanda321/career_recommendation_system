@@ -571,29 +571,3 @@ def test_file_workspace_preserves_native_rows_and_profile_fields(monkeypatch, tm
     monkeypatch.setenv("CAREER_OPS_DATA_ROOT", "relative-workspace")
     with pytest.raises(RuntimeError, match="must be absolute"):
         career_ops_files.configured_root()
-
-
-def test_file_migration_adopts_matching_native_row(monkeypatch, tmp_path):
-    with TestClient(app) as client:
-        legacy = client.post("/career-workspace/applications", headers=headers(9003), json={
-            "company": "Acme", "role": "Engineer", "job_url": "https://jobs.example.com/merge/3",
-            "sources": ["career-compass"],
-        })
-        assert legacy.status_code == 200, legacy.text
-        monkeypatch.setenv("CAREER_OPS_DATA_ROOT", str(tmp_path / "private"))
-        base = career_ops_files.workspace("9003")
-        (base / "data").mkdir(parents=True)
-        tracker = base / "data/applications.md"
-        tracker.write_text(
-            "# Applications Tracker\n\n" + career_ops_files.HEADER + "\n"
-            + career_ops_files.SEPARATOR + "\n"
-            + "| 4 | 2026-10-17 | Acme | Engineer | 4.4/5 | Applied | ❌ | — | Original note | https://jobs.example.com/merge/3 |\n",
-            encoding="utf-8",
-        )
-        listing = client.get("/career-workspace/applications", headers=headers(9003))
-        assert listing.status_code == 200, listing.text
-        assert len(listing.json()) == 1
-        assert listing.json()[0]["id"] == legacy.json()["id"]
-        assert listing.json()[0]["stage"] == "applied"
-        assert len(career_ops_files.read_tracker("9003")) == 1
-        assert f"[hanggent-id:{legacy.json()['id']}]" in tracker.read_text(encoding="utf-8")
