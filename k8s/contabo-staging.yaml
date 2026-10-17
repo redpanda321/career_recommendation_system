@@ -17,11 +17,6 @@ metadata: {name: career-compass-qdrant-data, namespace: NAMESPACE_PLACEHOLDER}
 spec: {accessModes: [ReadWriteOnce], storageClassName: local-path-retain, resources: {requests: {storage: 5Gi}}}
 ---
 apiVersion: v1
-kind: PersistentVolumeClaim
-metadata: {name: career-compass-career-ops-data, namespace: NAMESPACE_PLACEHOLDER}
-spec: {accessModes: [ReadWriteOnce], storageClassName: local-path-retain, resources: {requests: {storage: 5Gi}}}
----
-apiVersion: v1
 kind: Secret
 metadata: {name: career-compass-secrets, namespace: NAMESPACE_PLACEHOLDER}
 type: Opaque
@@ -160,7 +155,6 @@ kind: Deployment
 metadata: {name: career-compass-job, namespace: NAMESPACE_PLACEHOLDER}
 spec:
   replicas: 1
-  strategy: {type: Recreate}
   selector: {matchLabels: {app: career-compass-job}}
   template:
     metadata: {labels: {app: career-compass-job}}
@@ -175,9 +169,6 @@ spec:
         - {name: DATABASE_URL, value: postgresql+asyncpg://career:CAREER_DB_PASSWORD_PLACEHOLDER@career-compass-postgres:5432/job_service_db}
         - {name: EMBEDDING_SERVICE_URL, value: http://career-compass-embedding:8003/embed/job}
         - {name: VECTORDB_SERVICE_URL, value: http://career-compass-vector:8005/store}
-        - {name: CAREER_OPS_DATA_ROOT, value: /app/career-ops-data}
-        volumeMounts: [{name: career-ops-data, mountPath: /app/career-ops-data}]
-      volumes: [{name: career-ops-data, persistentVolumeClaim: {claimName: career-compass-career-ops-data}}]
 ---
 apiVersion: apps/v1
 kind: Deployment

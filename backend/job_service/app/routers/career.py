@@ -17,7 +17,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.career_auth import career_user
-from app import career_ops_files as files
 from app.database import get_db
 from app.models import (
     CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerStageEvent,
@@ -75,12 +74,6 @@ class ApplicationIn(BaseModel):
     score_kind: str = Field(default="unverified", pattern="^(unverified|resume_overlap|career_ops_import|career_ops_evaluation)$")
     sources: list[str] = Field(default_factory=list, max_length=5)
     notes: list[str] = Field(default_factory=list, max_length=20)
-
-
-class PipelineIn(BaseModel):
-    job_url: str
-    company: str = Field(default="", max_length=200)
-    role: str = Field(default="", max_length=200)
 
 
 class CandidateProfileIn(BaseModel):
@@ -174,73 +167,11 @@ def _profile_out(profile: CareerCandidateProfile | None) -> dict:
     }
 
 
-def _file_item(item: CareerApplication) -> dict:
-    return {key: getattr(item, key) for key in (
-        "id", "canonical_key", "company", "role", "location", "job_url", "stage",
-        "fit_score", "score_kind", "sources", "notes",
-    )}
-
-
-async def _sync_file_index(user_id: str, db: AsyncSession) -> None:
-    """Rebuild the query index from user files; bootstrap legacy DB rows once."""
-    if files.configured_root() is None:
-        return
-    changed = False
-    existing = (await db.execute(select(CareerApplication).where(
-        CareerApplication.user_id == user_id,
-    ))).scalars().all()
-    file_rows = {row["id"]: row for row in files.read_tracker(user_id)}
-    file_keys = set()
-    for row in file_rows.values():
-        payload = files.read_application(user_id, row["id"])
-        if payload:
-            file_keys.add(payload["canonical_key"])
-    if not files.migration_complete(user_id):
-        for item in existing:
-            if item.id not in file_rows and item.canonical_key not in file_keys:
-                # Retry an interrupted migration, but never resurrect a row
-                # removed by the user after migration has completed.
-                files.write_application(user_id, _file_item(item))
-        files.mark_migration_complete(user_id)
-    for row in files.read_tracker(user_id):
-        payload = files.read_application(user_id, row["id"])
-        if payload is None:
-            continue
-        item = next((candidate for candidate in existing if candidate.id == row["id"]), None)
-        if item is None:
-            # A native career-ops row can coincide with an older DB record.
-            # Keep the original API identity and do not create a duplicate.
-            if any(candidate.canonical_key == payload["canonical_key"] for candidate in existing):
-                continue
-            item = CareerApplication(user_id=user_id, id=row["id"])
-            db.add(item)
-            existing.append(item)
-            changed = True
-        for key in ("canonical_key", "company", "role", "location", "job_url", "stage",
-                    "fit_score", "score_kind", "sources", "notes"):
-            if getattr(item, key, None) != payload[key]:
-                setattr(item, key, payload[key])
-                changed = True
-    if changed:
-        await db.commit()
-
-
-def _require_file_row(user_id: str, application_id: str) -> None:
-    if files.configured_root() is not None and files.read_application(user_id, application_id) is None:
-        raise HTTPException(404, "Application not found in career-ops tracker")
-
-
 @router.get("/profile")
 async def get_candidate_profile(
     user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
 ):
-    if files.configured_root() is not None:
-        saved = files.read_profile(user_id)
-        if saved is not None:
-            return saved
     profile = await db.get(CareerCandidateProfile, user_id)
-    if profile is not None and files.configured_root() is not None:
-        files.write_profile(user_id, _profile_out(profile))
     return _profile_out(profile)
 
 
@@ -249,8 +180,6 @@ async def save_candidate_profile(
     body: CandidateProfileIn, user_id: str = Depends(career_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if files.configured_root() is not None:
-        files.write_profile(user_id, body.model_dump())
     profile = await db.get(CareerCandidateProfile, user_id)
     if profile is None:
         profile = CareerCandidateProfile(user_id=user_id)
@@ -270,8 +199,6 @@ async def record_candidate_feedback(
         raise HTTPException(400, "Invalid stage")
     if len(body.note.strip()) < 3:
         raise HTTPException(400, "A meaningful feedback note is required")
-    await _sync_file_index(user_id, db)
-    _require_file_row(user_id, application_id)
     application = (await db.execute(select(CareerApplication).where(
         CareerApplication.id == application_id, CareerApplication.user_id == user_id,
     ).with_for_update())).scalar_one_or_none()
@@ -284,15 +211,6 @@ async def record_candidate_feedback(
     )
     application.stage = body.stage
     db.add(event)
-    if files.configured_root() is not None:
-        files.write_application(user_id, _file_item(application))
-        tracker = next((item for item in files.read_tracker(user_id)
-                        if item["id"] == application_id), None)
-        if tracker is not None and previous != body.stage:
-            files.append_event(user_id, "data/status-log.tsv", "\t".join((
-                tracker["#"], datetime.now(timezone.utc).date().isoformat(),
-                files.STAGES[previous], files.STAGES[body.stage], "web",
-                body.note.strip().replace("\t", " ").replace("\n", " "))))
     await db.commit()
     await db.refresh(application)
     return {"application": _application_out(application), "event_id": event.id,
@@ -304,8 +222,6 @@ async def record_employer_contact(
     application_id: str, body: ContactIn,
     user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
 ):
-    await _sync_file_index(user_id, db)
-    _require_file_row(user_id, application_id)
     application = (await db.execute(select(CareerApplication).where(
         CareerApplication.id == application_id, CareerApplication.user_id == user_id,
     ))).scalar_one_or_none()
@@ -330,11 +246,6 @@ async def record_employer_contact(
         next_followup_at=body.next_followup_at,
     )
     db.add(event)
-    if files.configured_root() is not None:
-        stamp = body.contacted_at.isoformat()
-        note = body.note.strip().replace("\n", " ")
-        files.append_event(user_id, "data/follow-ups.md",
-                           f"- {stamp} | {application.company} | {application.role} | {body.channel} | {note}")
     await db.commit()
     return {"id": event.id, "channel": event.channel, "note": event.note,
             "contacted_at": event.contacted_at, "next_followup_at": event.next_followup_at,
@@ -473,8 +384,6 @@ async def resolve_uncertain_attempt(
 async def application_activity(
     application_id: str, user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
 ):
-    await _sync_file_index(user_id, db)
-    _require_file_row(user_id, application_id)
     application = (await db.execute(select(CareerApplication).where(
         CareerApplication.id == application_id, CareerApplication.user_id == user_id,
     ))).scalar_one_or_none()
@@ -483,14 +392,6 @@ async def application_activity(
     artifacts = (await db.execute(select(CareerArtifact).where(
         CareerArtifact.application_id == application_id, CareerArtifact.user_id == user_id,
     ).order_by(CareerArtifact.created_at.desc()))).scalars().all()
-    if files.configured_root() is not None:
-        for artifact in artifacts:
-            saved = files.read_artifact(user_id, artifact.id)
-            if saved is None:
-                files.write_artifact(user_id, application_id, artifact.id,
-                                     artifact.kind, artifact.content_markdown)
-            else:
-                artifact.content_markdown = saved
     attempts = (await db.execute(select(SubmissionAttempt).where(
         SubmissionAttempt.application_id == application_id, SubmissionAttempt.user_id == user_id,
     ).order_by(SubmissionAttempt.created_at.desc()))).scalars().all()
@@ -519,7 +420,6 @@ async def application_activity(
 
 @router.get("/applications")
 async def list_applications(user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db)):
-    await _sync_file_index(user_id, db)
     # A crashed worker cannot hold a job in "running" forever. Its external
     # outcome is unknown, so require candidate verification before another try.
     expired = (await db.execute(select(SubmissionAttempt).where(
@@ -538,9 +438,6 @@ async def list_applications(user_id: str = Depends(career_user), db: AsyncSessio
         select(CareerApplication).where(CareerApplication.user_id == user_id)
         .order_by(CareerApplication.created_at.desc())
     )).scalars().all()
-    if files.configured_root() is not None:
-        active_ids = {item["id"] for item in files.read_tracker(user_id)}
-        rows = [row for row in rows if row.id in active_ids]
     blocked_rows = (await db.execute(select(
         SubmissionAttempt.application_id, SubmissionAttempt.id, SubmissionAttempt.status,
     ).where(
@@ -560,30 +457,11 @@ async def list_applications(user_id: str = Depends(career_user), db: AsyncSessio
                              latest_contact=latest_contacts.get(row.id)) for row in rows]
 
 
-@router.get("/pipeline")
-async def list_pipeline(user_id: str = Depends(career_user)):
-    return files.read_pipeline(user_id) if files.configured_root() is not None else []
-
-
-@router.post("/pipeline")
-async def queue_pipeline_url(body: PipelineIn, user_id: str = Depends(career_user)):
-    if files.configured_root() is None:
-        raise HTTPException(503, "Career-ops file workspace is not configured")
-    try:
-        url = canonical_url(body.job_url)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    files.write_pipeline(user_id, url, body.company.strip(), body.role.strip())
-    return {"job_url": url, "status": "pending"}
-
-
 @router.get("/applications/{application_id}")
 async def get_application(
     application_id: str, user_id: str = Depends(career_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _sync_file_index(user_id, db)
-    _require_file_row(user_id, application_id)
     row = (await db.execute(select(CareerApplication).where(
         CareerApplication.id == application_id, CareerApplication.user_id == user_id,
     ))).scalar_one_or_none()
@@ -614,7 +492,6 @@ async def upsert_application(
     key = url or "::".join(
         part.strip().casefold() for part in (body.company, body.role, body.location or "")
     )
-    await _sync_file_index(user_id, db)
     row = (await db.execute(select(CareerApplication).where(
         CareerApplication.user_id == user_id, CareerApplication.canonical_key == key,
     ))).scalar_one_or_none()
@@ -647,13 +524,6 @@ async def upsert_application(
             row.fit_score = max(row.fit_score or 0, body.fit_score)
             row.score_kind = body.score_kind
     try:
-        if files.configured_root() is not None:
-            await db.flush()
-            files.write_application(user_id, _file_item(row))
-            if url and body.score_kind != "career_ops_evaluation" and body.stage == "saved":
-                files.write_pipeline(user_id, url, body.company.strip(), body.role.strip())
-            elif url and body.score_kind == "career_ops_evaluation":
-                files.write_pipeline(user_id, url, body.company.strip(), body.role.strip(), processed=True)
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
@@ -667,8 +537,6 @@ async def add_artifact(
     application_id: str, body: ArtifactIn, user_id: str = Depends(career_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _sync_file_index(user_id, db)
-    _require_file_row(user_id, application_id)
     application = (await db.execute(select(CareerApplication).where(
         CareerApplication.id == application_id, CareerApplication.user_id == user_id,
     ))).scalar_one_or_none()
@@ -683,11 +551,6 @@ async def add_artifact(
     )
     db.add(artifact)
     try:
-        if files.configured_root() is not None:
-            await db.flush()
-            files.write_artifact(user_id, application_id, artifact.id, body.kind, body.content_markdown)
-            if body.kind == "evaluation":
-                files.link_evaluation_report(user_id, application_id, artifact.id)
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
@@ -709,8 +572,6 @@ async def authorize_submission(
     if body.mode == "confirm_each":
         if not body.application_id or body.max_applications != 1:
             raise HTTPException(400, "A one-application confirmation is required")
-        await _sync_file_index(user_id, db)
-        _require_file_row(user_id, body.application_id)
         application = (await db.execute(select(CareerApplication).where(
             CareerApplication.id == body.application_id, CareerApplication.user_id == user_id,
         ))).scalar_one_or_none()
@@ -748,8 +609,6 @@ async def queue_submission(
     application_id: str, body: AttemptIn, user_id: str = Depends(career_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _sync_file_index(user_id, db)
-    _require_file_row(user_id, application_id)
     existing = (await db.execute(select(SubmissionAttempt).where(
         SubmissionAttempt.user_id == user_id, SubmissionAttempt.idempotency_key == body.idempotency_key,
     ))).scalar_one_or_none()
