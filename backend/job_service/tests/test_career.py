@@ -13,7 +13,7 @@ from jose import jwt
 
 from app.database import AsyncSessionLocal, Base, engine
 from app.models import (
-    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerStageEvent,
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
 )
 from app.routers.career import router
@@ -41,7 +41,7 @@ def setup_module():
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all, tables=[
                 CareerApplication.__table__, CareerArtifact.__table__,
-                CareerCandidateProfile.__table__, CareerStageEvent.__table__,
+                CareerCandidateProfile.__table__, CareerStageEvent.__table__, CareerContactEvent.__table__,
                 SubmissionAuthorization.__table__, SubmissionAttempt.__table__,
             ])
     asyncio.run(create_tables())
@@ -140,6 +140,44 @@ def test_profile_and_feedback_are_candidate_scoped_and_auditable():
             },
         )
         assert drafted.status_code == 200, drafted.text
+
+
+def test_confirmed_contact_is_separate_from_draft_and_drives_reminder():
+    with TestClient(app) as client:
+        case = client.post("/career-workspace/applications", headers=headers(50), json={
+            "company": "Contact Co", "role": "Analyst", "stage": "applied",
+        }).json()
+        endpoint = f"/career-workspace/applications/{case['id']}/contacts"
+        payload = {
+            "channel": "email", "note": "Sent recruiter a follow-up email",
+            "contacted_at": "2026-10-15T10:00:00Z",
+            "next_followup_at": "2026-10-20T10:00:00Z", "confirmed_contact": True,
+        }
+        assert client.post(endpoint, headers=headers(51), json=payload).status_code == 404
+        assert client.post(endpoint, headers=headers(50), json={
+            **payload, "confirmed_contact": False,
+        }).status_code == 400
+        assert client.post(endpoint, headers=headers(50), json={
+            **payload, "next_followup_at": "2026-10-14T10:00:00Z",
+        }).status_code == 400
+        drafted = client.post(
+            f"/career-workspace/applications/{case['id']}/artifacts", headers=headers(50),
+            json={"kind": "followup", "source": "hanggent", "content_markdown": "Draft only"},
+        )
+        assert drafted.status_code == 200, drafted.text
+        assert client.get(f"{endpoint.removesuffix('/contacts')}/activity", headers=headers(50)).json()["contacts"] == []
+        response = client.post(endpoint, headers=headers(50), json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["source"] == "candidate_confirmed"
+        listed = client.get("/career-workspace/applications", headers=headers(50)).json()
+        assert listed[0]["last_contact_at"].startswith("2026-10-15")
+        assert listed[0]["next_followup_at"].startswith("2026-10-20")
+        detail = client.get(f"/career-workspace/applications/{case['id']}", headers=headers(50)).json()
+        assert detail["next_followup_at"] == listed[0]["next_followup_at"]
+        activity = client.get(f"/career-workspace/applications/{case['id']}/activity", headers=headers(50)).json()
+        assert len(activity["contacts"]) == 1
+        assert activity["contacts"][0]["note"] == payload["note"]
+        assert client.get(f"/career-workspace/applications/{case['id']}/activity", headers=headers(51)).status_code == 404
 
 
 def test_one_job_confirmation_and_bounded_auto_authorization():

@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.career_auth import career_user
 from app.database import get_db
 from app.models import (
-    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerStageEvent,
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
 )
 
@@ -89,6 +89,14 @@ class StageFeedbackIn(BaseModel):
     note: str = Field(min_length=3, max_length=2000)
 
 
+class ContactIn(BaseModel):
+    channel: str = Field(pattern="^(email|linkedin|phone|other)$")
+    note: str = Field(min_length=3, max_length=2000)
+    contacted_at: datetime
+    next_followup_at: datetime | None = None
+    confirmed_contact: bool
+
+
 class ArtifactIn(BaseModel):
     kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|interview_prep|followup|offer_prep)$")
     source: str = Field(pattern="^(career-compass|career-ops|ai-job-search|proficiently|hanggent)$")
@@ -128,6 +136,7 @@ class ResolveIn(BaseModel):
 
 def _application_out(
     item: CareerApplication, *, blocking_attempt: tuple[str, str] | None = None,
+    latest_contact: CareerContactEvent | None = None,
 ) -> dict:
     return {
         "id": item.id, "company": item.company, "role": item.role,
@@ -137,6 +146,8 @@ def _application_out(
         "submission_blocked": blocking_attempt is not None,
         "blocking_attempt_id": blocking_attempt[0] if blocking_attempt else None,
         "blocking_attempt_status": blocking_attempt[1] if blocking_attempt else None,
+        "last_contact_at": latest_contact.contacted_at if latest_contact else None,
+        "next_followup_at": latest_contact.next_followup_at if latest_contact else None,
     }
 
 
@@ -202,6 +213,41 @@ async def record_candidate_feedback(
     await db.refresh(application)
     return {"application": _application_out(application), "event_id": event.id,
             "external_submission": "candidate_reported" if body.stage == "applied" else "not_claimed"}
+
+
+@router.post("/applications/{application_id}/contacts")
+async def record_employer_contact(
+    application_id: str, body: ContactIn,
+    user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    application = (await db.execute(select(CareerApplication).where(
+        CareerApplication.id == application_id, CareerApplication.user_id == user_id,
+    ))).scalar_one_or_none()
+    if application is None:
+        raise HTTPException(404, "Application not found")
+    if application.stage in {"saved", "closed", "accepted"}:
+        raise HTTPException(409, "Employer contact requires an active application")
+    if not body.confirmed_contact or len(body.note.strip()) < 3:
+        raise HTTPException(400, "Confirm actual contact and include a meaningful note")
+    if body.contacted_at.tzinfo is None or (
+        body.next_followup_at is not None and body.next_followup_at.tzinfo is None
+    ):
+        raise HTTPException(400, "Contact and reminder times must include a timezone")
+    now = datetime.now(timezone.utc)
+    if body.contacted_at > now + timedelta(minutes=5):
+        raise HTTPException(400, "Contact cannot be in the future")
+    if body.next_followup_at is not None and body.next_followup_at <= body.contacted_at:
+        raise HTTPException(400, "Reminder must be after the contact")
+    event = CareerContactEvent(
+        application_id=application_id, user_id=user_id, channel=body.channel,
+        note=body.note.strip(), contacted_at=body.contacted_at,
+        next_followup_at=body.next_followup_at,
+    )
+    db.add(event)
+    await db.commit()
+    return {"id": event.id, "channel": event.channel, "note": event.note,
+            "contacted_at": event.contacted_at, "next_followup_at": event.next_followup_at,
+            "source": "candidate_confirmed"}
 
 
 @router.get("/submission-attempts/{attempt_id}")
@@ -350,6 +396,9 @@ async def application_activity(
     feedback = (await db.execute(select(CareerStageEvent).where(
         CareerStageEvent.application_id == application_id, CareerStageEvent.user_id == user_id,
     ).order_by(CareerStageEvent.created_at.desc()))).scalars().all()
+    contacts = (await db.execute(select(CareerContactEvent).where(
+        CareerContactEvent.application_id == application_id, CareerContactEvent.user_id == user_id,
+    ).order_by(CareerContactEvent.contacted_at.desc(), CareerContactEvent.created_at.desc()))).scalars().all()
     return {
         "artifacts": [{"id": item.id, "kind": item.kind, "source": item.source,
                        "version": item.version, "content_markdown": item.content_markdown}
@@ -361,6 +410,9 @@ async def application_activity(
                       "to_stage": item.to_stage, "note": item.note,
                       "source": item.source, "created_at": item.created_at}
                      for item in feedback],
+        "contacts": [{"id": item.id, "channel": item.channel, "note": item.note,
+                      "contacted_at": item.contacted_at, "next_followup_at": item.next_followup_at,
+                      "source": "candidate_confirmed"} for item in contacts],
     }
 
 
@@ -393,7 +445,14 @@ async def list_applications(user_id: str = Depends(career_user), db: AsyncSessio
     blocked = {}
     for application_id, attempt_id, status in blocked_rows:
         blocked.setdefault(application_id, (attempt_id, status))
-    return [_application_out(row, blocking_attempt=blocked.get(row.id)) for row in rows]
+    contact_rows = (await db.execute(select(CareerContactEvent).where(
+        CareerContactEvent.user_id == user_id,
+    ).order_by(CareerContactEvent.contacted_at.desc(), CareerContactEvent.created_at.desc()))).scalars().all()
+    latest_contacts = {}
+    for contact in contact_rows:
+        latest_contacts.setdefault(contact.application_id, contact)
+    return [_application_out(row, blocking_attempt=blocked.get(row.id),
+                             latest_contact=latest_contacts.get(row.id)) for row in rows]
 
 
 @router.get("/applications/{application_id}")
@@ -406,7 +465,10 @@ async def get_application(
     ))).scalar_one_or_none()
     if row is None:
         raise HTTPException(404, "Application not found")
-    return _application_out(row)
+    contact = (await db.execute(select(CareerContactEvent).where(
+        CareerContactEvent.application_id == application_id, CareerContactEvent.user_id == user_id,
+    ).order_by(CareerContactEvent.contacted_at.desc(), CareerContactEvent.created_at.desc()).limit(1))).scalar_one_or_none()
+    return _application_out(row, latest_contact=contact)
 
 
 @router.post("/applications")
