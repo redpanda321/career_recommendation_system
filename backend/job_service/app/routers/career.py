@@ -18,7 +18,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.career_auth import career_user
 from app.database import get_db
-from app.models import CareerApplication, CareerArtifact, SubmissionAuthorization, SubmissionAttempt
+from app.models import (
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerStageEvent,
+    SubmissionAuthorization, SubmissionAttempt,
+)
 
 
 router = APIRouter(tags=["career-workspace"])
@@ -70,6 +73,20 @@ class ApplicationIn(BaseModel):
     fit_score: float | None = Field(default=None, ge=0, le=100)
     sources: list[str] = Field(default_factory=list, max_length=5)
     notes: list[str] = Field(default_factory=list, max_length=20)
+
+
+class CandidateProfileIn(BaseModel):
+    full_name: str = Field(default="", max_length=200)
+    headline: str = Field(default="", max_length=300)
+    location: str = Field(default="", max_length=200)
+    target_roles: list[str] = Field(default_factory=list, max_length=20)
+    skills: list[str] = Field(default_factory=list, max_length=100)
+    resume_markdown: str = Field(default="", max_length=100000)
+
+
+class StageFeedbackIn(BaseModel):
+    stage: str
+    note: str = Field(min_length=3, max_length=2000)
 
 
 class ArtifactIn(BaseModel):
@@ -124,6 +141,65 @@ def _application_out(
 
 def _expiry(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _profile_out(profile: CareerCandidateProfile | None) -> dict:
+    if profile is None:
+        return CandidateProfileIn().model_dump()
+    return {
+        "full_name": profile.full_name, "headline": profile.headline,
+        "location": profile.location, "target_roles": profile.target_roles,
+        "skills": profile.skills, "resume_markdown": profile.resume_markdown,
+    }
+
+
+@router.get("/profile")
+async def get_candidate_profile(
+    user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    profile = await db.get(CareerCandidateProfile, user_id)
+    return _profile_out(profile)
+
+
+@router.put("/profile")
+async def save_candidate_profile(
+    body: CandidateProfileIn, user_id: str = Depends(career_user),
+    db: AsyncSession = Depends(get_db),
+):
+    profile = await db.get(CareerCandidateProfile, user_id)
+    if profile is None:
+        profile = CareerCandidateProfile(user_id=user_id)
+        db.add(profile)
+    for field, value in body.model_dump().items():
+        setattr(profile, field, value)
+    await db.commit()
+    return _profile_out(profile)
+
+
+@router.post("/applications/{application_id}/feedback")
+async def record_candidate_feedback(
+    application_id: str, body: StageFeedbackIn,
+    user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    if body.stage not in STAGES:
+        raise HTTPException(400, "Invalid stage")
+    if len(body.note.strip()) < 3:
+        raise HTTPException(400, "A meaningful feedback note is required")
+    application = (await db.execute(select(CareerApplication).where(
+        CareerApplication.id == application_id, CareerApplication.user_id == user_id,
+    ).with_for_update())).scalar_one_or_none()
+    if application is None:
+        raise HTTPException(404, "Application not found")
+    previous = application.stage
+    event = CareerStageEvent(
+        application_id=application_id, user_id=user_id, from_stage=previous,
+        to_stage=body.stage, note=body.note.strip(), source="candidate",
+    )
+    application.stage = body.stage
+    db.add(event)
+    await db.commit()
+    return {"application": _application_out(application), "event_id": event.id,
+            "external_submission": "candidate_reported" if body.stage == "applied" else "not_claimed"}
 
 
 @router.get("/submission-attempts/{attempt_id}")
@@ -269,6 +345,9 @@ async def application_activity(
     attempts = (await db.execute(select(SubmissionAttempt).where(
         SubmissionAttempt.application_id == application_id, SubmissionAttempt.user_id == user_id,
     ).order_by(SubmissionAttempt.created_at.desc()))).scalars().all()
+    feedback = (await db.execute(select(CareerStageEvent).where(
+        CareerStageEvent.application_id == application_id, CareerStageEvent.user_id == user_id,
+    ).order_by(CareerStageEvent.created_at.desc()))).scalars().all()
     return {
         "artifacts": [{"id": item.id, "kind": item.kind, "source": item.source,
                        "version": item.version, "content_markdown": item.content_markdown}
@@ -276,6 +355,10 @@ async def application_activity(
         "submission_attempts": [{"id": item.id, "site": item.site, "status": item.status,
                                  "receipt": item.receipt, "error": item.error}
                                 for item in attempts],
+        "feedback": [{"id": item.id, "from_stage": item.from_stage,
+                      "to_stage": item.to_stage, "note": item.note,
+                      "source": item.source, "created_at": item.created_at}
+                     for item in feedback],
     }
 
 

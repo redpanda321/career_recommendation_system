@@ -12,7 +12,10 @@ from fastapi.testclient import TestClient
 from jose import jwt
 
 from app.database import AsyncSessionLocal, Base, engine
-from app.models import CareerApplication, CareerArtifact, SubmissionAuthorization, SubmissionAttempt
+from app.models import (
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerStageEvent,
+    SubmissionAuthorization, SubmissionAttempt,
+)
 from app.routers.career import router
 
 
@@ -38,9 +41,14 @@ def setup_module():
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all, tables=[
                 CareerApplication.__table__, CareerArtifact.__table__,
+                CareerCandidateProfile.__table__, CareerStageEvent.__table__,
                 SubmissionAuthorization.__table__, SubmissionAttempt.__table__,
             ])
     asyncio.run(create_tables())
+
+
+def teardown_module():
+    asyncio.run(engine.dispose())
 
 
 def test_requires_scoped_bridge_identity():
@@ -89,6 +97,36 @@ def test_applications_are_idempotent_and_user_isolated():
             f"/career-workspace/applications/{first.json()['id']}/activity", headers=headers(1)
         ).json()
         assert len(activity["artifacts"]) == 1
+
+
+def test_profile_and_feedback_are_candidate_scoped_and_auditable():
+    with TestClient(app) as client:
+        assert client.get("/career-workspace/profile", headers=headers(41)).json()["full_name"] == ""
+        saved = client.put("/career-workspace/profile", headers=headers(41), json={
+            "full_name": "Alex Example", "target_roles": ["Engineer"],
+            "skills": ["Python"], "resume_markdown": "# Reviewed resume",
+        })
+        assert saved.status_code == 200, saved.text
+        assert client.get("/career-workspace/profile", headers=headers(41)).json()["skills"] == ["Python"]
+        assert client.get("/career-workspace/profile", headers=headers(42)).json()["full_name"] == ""
+        case = client.post("/career-workspace/applications", headers=headers(41), json={
+            "company": "Example", "role": "Engineer", "sources": ["career-ops"],
+        }).json()
+        endpoint = f"/career-workspace/applications/{case['id']}/feedback"
+        assert client.post(endpoint, headers=headers(42), json={
+            "stage": "interview", "note": "Employer invited me",
+        }).status_code == 404
+        changed = client.post(endpoint, headers=headers(41), json={
+            "stage": "interview", "note": "Employer invited me",
+        })
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["application"]["stage"] == "interview"
+        events = client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(41)
+        ).json()["feedback"]
+        assert events[-1]["from_stage"] == "saved"
+        assert events[-1]["to_stage"] == "interview"
+        assert events[-1]["note"] == "Employer invited me"
 
 
 def test_one_job_confirmation_and_bounded_auto_authorization():
