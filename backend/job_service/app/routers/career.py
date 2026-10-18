@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.career_auth import career_user
 from app.comparison_evidence import parse_requirement_evidence, parse_score_evidence
 from app.database import get_db
+from app.evaluation_sources import parse_source_snapshot, report_source_id, verify_requirement_quotes
 from app.models import (
     CareerApplication, CareerArtifact, CareerCandidateProfile, CareerComparisonSnapshot,
     CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
@@ -101,6 +102,7 @@ class ComparisonIn(BaseModel):
 
 class EvaluationScoreIn(BaseModel):
     artifact_id: UUID
+    source_artifact_id: UUID | None = None
 
 
 class StageFeedbackIn(BaseModel):
@@ -117,7 +119,7 @@ class ContactIn(BaseModel):
 
 
 class ArtifactIn(BaseModel):
-    kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|research|research_task_link|source_observation|liveness_check|interview_prep|followup|offer_prep)$")
+    kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|evaluation_sources|research|research_task_link|source_observation|liveness_check|interview_prep|followup|offer_prep)$")
     source: str = Field(pattern="^(career-compass|career-ops|ai-job-search|proficiently|hanggent)$")
     content_markdown: str = Field(min_length=1, max_length=100000)
 
@@ -162,6 +164,7 @@ def _application_out(
         "location": item.location, "job_url": item.job_url, "stage": item.stage,
         "fit_score": item.fit_score, "score_kind": item.score_kind,
         "evaluation_artifact_id": item.evaluation_artifact_id,
+        "evaluation_source_artifact_id": item.evaluation_source_artifact_id,
         "sources": item.sources, "notes": item.notes,
         "created_at": item.created_at, "updated_at": item.updated_at,
         "submission_blocked": blocking_attempt is not None,
@@ -537,6 +540,11 @@ async def create_comparison(
             "role": application.role, "stage": application.stage,
             "fit_score": ranked_score, "score_kind": application.score_kind,
             "evaluation_artifact_id": evidence.id if ranked_score is not None else None,
+            "evaluation_source_artifact_id": application.evaluation_source_artifact_id
+            if ranked_score is not None else None,
+            "source_provenance": "unranked" if ranked_score is None else (
+                "snapshot_verified" if application.evaluation_source_artifact_id else "legacy_unverified"
+            ),
             "evaluation_version": evidence.version if ranked_score is not None else None,
             "score_evidence": parse_score_evidence(evidence.content_markdown) if ranked_score is not None else None,
             "requirement_evidence": parse_requirement_evidence(evidence.content_markdown)
@@ -649,6 +657,7 @@ async def upsert_application(
             row.fit_score = body.fit_score
             row.score_kind = body.score_kind
             row.evaluation_artifact_id = None
+            row.evaluation_source_artifact_id = None
         elif body.score_kind == "career_ops_import" and row.score_kind != "career_ops_evaluation":
             row.fit_score = body.fit_score
             row.score_kind = body.score_kind
@@ -700,8 +709,29 @@ async def bind_evaluation_score(
         raise HTTPException(400, "Evaluation report has no valid 1-5 score")
     if parse_score_evidence(artifact.content_markdown) is None:
         raise HTTPException(400, "Evaluation report has no complete score evidence")
-    if parse_requirement_evidence(artifact.content_markdown) is None:
+    requirements = parse_requirement_evidence(artifact.content_markdown)
+    if requirements is None:
         raise HTTPException(400, "Evaluation report has no complete requirement evidence")
+    marker_id = report_source_id(artifact.content_markdown)
+    if body.source_artifact_id is not None or "career-source-artifact:" in artifact.content_markdown:
+        if marker_id is None or marker_id != str(body.source_artifact_id):
+            raise HTTPException(400, "Evaluation report source reference is missing or mismatched")
+        source = (await db.execute(select(CareerArtifact).where(
+            CareerArtifact.id == marker_id, CareerArtifact.application_id == application_id,
+            CareerArtifact.user_id == user_id, CareerArtifact.kind == "evaluation_sources",
+            CareerArtifact.source == "hanggent",
+        ))).scalar_one_or_none()
+        if source is None:
+            raise HTTPException(404, "Evaluation source snapshot not found")
+        snapshot = parse_source_snapshot(source.content_markdown)
+        if snapshot is None:
+            raise HTTPException(400, "Evaluation source snapshot is invalid")
+        if not verify_requirement_quotes(requirements, resume=snapshot["resume_markdown"],
+                                         job=snapshot["job_description"]):
+            raise HTTPException(400, "Evaluation quotes do not match the source snapshot")
+        application.evaluation_source_artifact_id = source.id
+    else:
+        application.evaluation_source_artifact_id = None
     application.fit_score = round(float(score_matches[0]) * 20, 2)
     application.score_kind = "career_ops_evaluation"
     application.evaluation_artifact_id = artifact.id

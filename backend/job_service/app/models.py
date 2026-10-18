@@ -50,6 +50,7 @@ class CareerApplication(Base):
     fit_score = Column(Float)
     score_kind = Column(String(32), nullable=False, default="unverified")
     evaluation_artifact_id = Column(String(36))
+    evaluation_source_artifact_id = Column(String(36))
     sources = Column(JSON, nullable=False, default=list)
     notes = Column(JSON, nullable=False, default=list)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

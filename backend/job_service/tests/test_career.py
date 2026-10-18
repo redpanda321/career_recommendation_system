@@ -1,6 +1,8 @@
 """Cross-user, consent and idempotency checks for the canonical career store."""
 
 import asyncio
+import hashlib
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -185,6 +187,7 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
         ]
         assert all(entry["evaluation_artifact_id"] for entry in snapshot["entries"][:2])
         assert all(entry["score_provenance"] == "artifact_bound" for entry in snapshot["entries"][:2])
+        assert all(entry["source_provenance"] == "legacy_unverified" for entry in snapshot["entries"][:2])
         assert all(len(entry["score_evidence"]) == 5 for entry in snapshot["entries"][:2])
         assert all(entry["requirement_evidence"][0]["requirement"] == "Python services"
                    for entry in snapshot["entries"][:2])
@@ -192,6 +195,7 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
         assert all(entry["evaluation_artifact_id"] is None for entry in snapshot["entries"][2:])
         assert all(entry["score_evidence"] is None for entry in snapshot["entries"][2:])
         assert all(entry["requirement_evidence"] is None for entry in snapshot["entries"][2:])
+        assert all(entry["source_provenance"] == "unranked" for entry in snapshot["entries"][2:])
         assert client.get(endpoint, headers=headers(2002)).json() == []
 
         changed = client.post("/career-workspace/applications", headers=owner, json={
@@ -257,6 +261,74 @@ def test_evaluation_score_binding_rejects_cross_user_wrong_role_and_invalid_repo
         unchanged = client.get(f"/career-workspace/applications/{role['id']}", headers=owner).json()
         assert unchanged["fit_score"] is None
         assert unchanged["evaluation_artifact_id"] is None
+
+
+def test_evaluation_score_binds_owned_immutable_sources_and_checks_quotes():
+    with TestClient(app) as client:
+        owner = headers(2151)
+        role = client.post("/career-workspace/applications", headers=owner,
+                           json={"company": "Evidence", "role": "Engineer"}).json()
+        other = client.post("/career-workspace/applications", headers=owner,
+                            json={"company": "Other Evidence", "role": "Engineer"}).json()
+        resume = "Built Python APIs with SQL and maintained production reliability."
+        job = "Build Python APIs and maintain reliable production services."
+        snapshot = {"schema_version": 1, "resume_markdown": resume, "job_description": job,
+                    "resume_sha256": hashlib.sha256(resume.encode()).hexdigest(),
+                    "job_sha256": hashlib.sha256(job.encode()).hexdigest()}
+
+        def add_source(application_id, payload=snapshot):
+            response = client.post(f"/career-workspace/applications/{application_id}/artifacts",
+                                   headers=owner, json={"kind": "evaluation_sources", "source": "hanggent",
+                                                        "content_markdown": json.dumps(payload)})
+            assert response.status_code == 200, response.text
+            return response.json()["id"]
+
+        source_id = add_source(role["id"])
+        other_source_id = add_source(other["id"])
+
+        def add_report(source_ref, cv_quote="Built Python APIs"):
+            report = ("**Score:** 4/5\n## B) Match with CV\n"
+                      "| Requirement | Importance | Match | JD signal | Evidence / gap |\n"
+                      "| --- | --- | --- | --- | --- |\n"
+                      f'| Python APIs | high (stated) | Strong | "Build Python APIs" | "{cv_quote}" |\n'
+                      "## Score Evidence\n"
+                      "| CV match | supported | Python APIs | Verify depth |\n"
+                      "| North Star alignment | partial | Role aligns | Confirm scope |\n"
+                      "| Compensation | unknown | Pay absent | Ask salary |\n"
+                      "| Cultural signals | unknown | Culture absent | Ask team |\n"
+                      "| Red flags | partial | Posting age unknown | Check liveness |\n"
+                      f"<!-- career-source-artifact: {source_ref} -->")
+            response = client.post(f"/career-workspace/applications/{role['id']}/artifacts",
+                                   headers=owner, json={"kind": "evaluation", "source": "career-ops",
+                                                        "content_markdown": report})
+            assert response.status_code == 200, response.text
+            return response.json()["id"]
+
+        wrong_quote = add_report(source_id, "Invented achievement")
+        path = f"/career-workspace/applications/{role['id']}/evaluation-score"
+        assert client.post(path, headers=owner, json={"artifact_id": wrong_quote,
+                                                     "source_artifact_id": source_id}).status_code == 400
+        valid_report = add_report(source_id)
+        assert client.post(path, headers=owner, json={"artifact_id": valid_report}).status_code == 400
+        assert client.post(path, headers=owner, json={"artifact_id": valid_report,
+                                                     "source_artifact_id": other_source_id}).status_code == 400
+        wrong_role_report = add_report(other_source_id)
+        assert client.post(path, headers=owner, json={"artifact_id": wrong_role_report,
+                                                     "source_artifact_id": other_source_id}).status_code == 404
+        invalid_snapshot = dict(snapshot, job_sha256="0" * 64)
+        invalid_source_id = add_source(role["id"], invalid_snapshot)
+        invalid_report = add_report(invalid_source_id)
+        assert client.post(path, headers=owner, json={"artifact_id": invalid_report,
+                                                     "source_artifact_id": invalid_source_id}).status_code == 400
+        bound = client.post(path, headers=owner, json={"artifact_id": valid_report,
+                                                      "source_artifact_id": source_id})
+        assert bound.status_code == 200, bound.text
+        assert bound.json()["evaluation_source_artifact_id"] == source_id
+        comparison = client.post("/career-workspace/comparisons", headers=owner, json={
+            "application_ids": [role["id"], other["id"]],
+        })
+        assert comparison.status_code == 200, comparison.text
+        assert comparison.json()["entries"][0]["source_provenance"] == "snapshot_verified"
 
 
 def test_applications_are_idempotent_and_user_isolated():
