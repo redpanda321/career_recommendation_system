@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.career_auth import career_user
-from app.comparison_evidence import parse_score_evidence
+from app.comparison_evidence import parse_requirement_evidence, parse_score_evidence
 from app.database import get_db
 from app.models import (
     CareerApplication, CareerArtifact, CareerCandidateProfile, CareerComparisonSnapshot,
@@ -539,6 +539,8 @@ async def create_comparison(
             "evaluation_artifact_id": evidence.id if ranked_score is not None else None,
             "evaluation_version": evidence.version if ranked_score is not None else None,
             "score_evidence": parse_score_evidence(evidence.content_markdown) if ranked_score is not None else None,
+            "requirement_evidence": parse_requirement_evidence(evidence.content_markdown)
+            if ranked_score is not None else None,
             "score_provenance": "artifact_bound" if ranked_score is not None else "unranked",
             "rank": None,
         })

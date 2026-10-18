@@ -140,7 +140,12 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
             response = client.post(
                 f"/career-workspace/applications/{application['id']}/artifacts",
                 headers=owner, json={"kind": "evaluation", "source": "career-ops",
-                                     "content_markdown": f"**Score:** {report_score}/5\n## Score Evidence\n"
+                                     "content_markdown": f"**Score:** {report_score}/5\n"
+                                     "## B) Match with CV\n"
+                                     "| Requirement | Importance | Match | JD signal | Evidence / gap |\n"
+                                     "| --- | --- | --- | --- | --- |\n"
+                                     "| Python services | high (structural) | ✅ Strong | Responsibilities: Python services | CV: Built Python APIs |\n"
+                                     "## C) Level and Strategy\nContext.\n## Score Evidence\n"
                                      "| Dimension | Status | Observation | Open question |\n"
                                      "| CV match | supported | Resume names Python. | Confirm depth. |\n"
                                      "| North Star alignment | partial | Target role matches. | Confirm scope. |\n"
@@ -181,9 +186,12 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
         assert all(entry["evaluation_artifact_id"] for entry in snapshot["entries"][:2])
         assert all(entry["score_provenance"] == "artifact_bound" for entry in snapshot["entries"][:2])
         assert all(len(entry["score_evidence"]) == 5 for entry in snapshot["entries"][:2])
+        assert all(entry["requirement_evidence"][0]["requirement"] == "Python services"
+                   for entry in snapshot["entries"][:2])
         assert snapshot["entries"][0]["score_evidence"][2]["status"] == "unknown"
         assert all(entry["evaluation_artifact_id"] is None for entry in snapshot["entries"][2:])
         assert all(entry["score_evidence"] is None for entry in snapshot["entries"][2:])
+        assert all(entry["requirement_evidence"] is None for entry in snapshot["entries"][2:])
         assert client.get(endpoint, headers=headers(2002)).json() == []
 
         changed = client.post("/career-workspace/applications", headers=owner, json={

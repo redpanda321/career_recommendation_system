@@ -28,6 +28,11 @@ evidence field instead of invented claims. These excerpts are generated report
 claims for review, not independently verified evidence. It never changes an application, chooses a role,
 or authorizes submission. This is a comparison of recorded evaluations, not
 an independent verification of the underlying claims.
+The same snapshot extracts at most 20 rows from career-ops Block B's single
+requirement matrix (requirement, importance and evidence tier, match, JD signal,
+candidate evidence or gap). Malformed or older reports retain null requirement
+evidence. The API does not invent a second matrix or verify that quoted report
+text appears in a source document; candidates must review the JD and resume.
 Historical snapshots created before this change retain a legacy provenance
 label: those older records only proved that an evaluation artifact existed,
 not that it produced the saved score.
