@@ -700,6 +700,8 @@ async def bind_evaluation_score(
         raise HTTPException(400, "Evaluation report has no valid 1-5 score")
     if parse_score_evidence(artifact.content_markdown) is None:
         raise HTTPException(400, "Evaluation report has no complete score evidence")
+    if parse_requirement_evidence(artifact.content_markdown) is None:
+        raise HTTPException(400, "Evaluation report has no complete requirement evidence")
     application.fit_score = round(float(score_matches[0]) * 20, 2)
     application.score_kind = "career_ops_evaluation"
     application.evaluation_artifact_id = artifact.id

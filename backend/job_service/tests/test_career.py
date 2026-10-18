@@ -243,6 +243,17 @@ def test_evaluation_score_binding_rejects_cross_user_wrong_role_and_invalid_repo
                                                      "| Cultural signals | unknown | Team absent | Ask team |\n"
                                                      "| Red flags | partial | Date absent | Check date |"}).json()
         assert client.post(path, headers=owner, json={"artifact_id": duplicate["id"]}).status_code == 400
+        missing_matrix = client.post(f"/career-workspace/applications/{role['id']}/artifacts",
+                                     headers=owner, json={"kind": "evaluation", "source": "career-ops",
+                                                          "content_markdown": "**Score:** 4/5\n## Score Evidence\n"
+                                                          "| CV match | supported | Resume facts | Confirm skills |\n"
+                                                          "| North Star alignment | partial | Target role | Confirm scope |\n"
+                                                          "| Compensation | unknown | Pay absent | Ask salary |\n"
+                                                          "| Cultural signals | unknown | Team absent | Ask team |\n"
+                                                          "| Red flags | partial | Date absent | Check date |"}).json()
+        rejected = client.post(path, headers=owner, json={"artifact_id": missing_matrix["id"]})
+        assert rejected.status_code == 400
+        assert rejected.json()["detail"] == "Evaluation report has no complete requirement evidence"
         unchanged = client.get(f"/career-workspace/applications/{role['id']}", headers=owner).json()
         assert unchanged["fit_score"] is None
         assert unchanged["evaluation_artifact_id"] is None
@@ -560,7 +571,12 @@ def test_auto_campaign_is_site_scoped_bounded_and_revocable():
         }, headers=headers(3)).status_code == 403
         report = client.post(f"/career-workspace/applications/{allowed['id']}/artifacts",
                              headers=headers(3), json={"kind": "evaluation", "source": "career-ops",
-                                                      "content_markdown": "**Score:** 4.75/5\n## Score Evidence\n"
+                                                      "content_markdown": "**Score:** 4.75/5\n"
+                                                      "## B) Match with CV\n"
+                                                      "| Requirement | Importance | Match | JD signal | Evidence / gap |\n"
+                                                      "| --- | --- | --- | --- | --- |\n"
+                                                      "| Python services | high (structural) | ✅ Strong | Responsibilities: Python services | CV: Built Python APIs |\n"
+                                                      "## Score Evidence\n"
                                                       "| CV match | supported | Resume facts | Confirm skills |\n"
                                                       "| North Star alignment | partial | Target role | Confirm scope |\n"
                                                       "| Compensation | unknown | Pay absent | Ask salary |\n"
