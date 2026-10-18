@@ -313,6 +313,13 @@ async def save_career_artifact(application_id: str, request: Request, _user: str
     return await _forward(request, f"applications/{application_id}/artifacts", "POST", await request.json())
 
 
+@router.post("/applications/{application_id}/evaluation-score")
+async def bind_canonical_evaluation_score(
+    application_id: str, request: Request, _user: str = Depends(career_user),
+):
+    return await _forward(request, f"applications/{application_id}/evaluation-score", "POST", await request.json())
+
+
 @router.post("/authorizations")
 async def create_submission_authorization(request: Request, _user: str = Depends(career_user)):
     return await _forward(request, "authorizations", "POST", await request.json())

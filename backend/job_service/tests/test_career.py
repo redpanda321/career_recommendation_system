@@ -118,11 +118,11 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
     with TestClient(app) as client:
         owner = headers(2001)
         first = client.post("/career-workspace/applications", headers=owner, json={
-            "company": "Alpha", "role": "Engineer", "fit_score": 85,
+            "company": "Alpha", "role": "Engineer", "fit_score": 10,
             "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
         }).json()
         second = client.post("/career-workspace/applications", headers=owner, json={
-            "company": "Beta", "role": "Engineer", "fit_score": 92,
+            "company": "Beta", "role": "Engineer", "fit_score": 20,
             "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
         }).json()
         preliminary = client.post("/career-workspace/applications", headers=owner, json={
@@ -136,11 +136,11 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
         outsider = client.post("/career-workspace/applications", headers=headers(2002), json={
             "company": "Private", "role": "Engineer",
         }).json()
-        for application in (first, second):
+        for application, report_score in ((first, "4.25"), (second, "4.6")):
             response = client.post(
                 f"/career-workspace/applications/{application['id']}/artifacts",
                 headers=owner, json={"kind": "evaluation", "source": "career-ops",
-                                     "content_markdown": "## Score Evidence\n"
+                                     "content_markdown": f"**Score:** {report_score}/5\n## Score Evidence\n"
                                      "| Dimension | Status | Observation | Open question |\n"
                                      "| CV match | supported | Resume names Python. | Confirm depth. |\n"
                                      "| North Star alignment | partial | Target role matches. | Confirm scope. |\n"
@@ -149,6 +149,13 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
                                      "| Red flags | partial | Posting age unknown. | Check liveness. |"},
             )
             assert response.status_code == 200, response.text
+            bound = client.post(
+                f"/career-workspace/applications/{application['id']}/evaluation-score",
+                headers=owner, json={"artifact_id": response.json()["id"]},
+            )
+            assert bound.status_code == 200, bound.text
+            assert bound.json()["fit_score"] == float(report_score) * 20
+            assert bound.json()["evaluation_artifact_id"] == response.json()["id"]
 
         endpoint = "/career-workspace/comparisons"
         selected = [preliminary["id"], first["id"], second["id"], missing_report["id"]]
@@ -164,7 +171,7 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
         response = client.post(endpoint, headers=owner, json={"application_ids": selected})
         assert response.status_code == 200, response.text
         snapshot = response.json()
-        assert snapshot["basis"] == "saved_evaluation_scores_only"
+        assert snapshot["basis"] == "bound_evaluation_scores_only"
         assert snapshot["external_action"] == "none"
         assert [(entry["company"], entry["rank"], entry["fit_score"])
                 for entry in snapshot["entries"]] == [
@@ -172,6 +179,7 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
             ("Delta", None, None), ("Gamma", None, None),
         ]
         assert all(entry["evaluation_artifact_id"] for entry in snapshot["entries"][:2])
+        assert all(entry["score_provenance"] == "artifact_bound" for entry in snapshot["entries"][:2])
         assert all(len(entry["score_evidence"]) == 5 for entry in snapshot["entries"][:2])
         assert snapshot["entries"][0]["score_evidence"][2]["status"] == "unknown"
         assert all(entry["evaluation_artifact_id"] is None for entry in snapshot["entries"][2:])
@@ -183,6 +191,7 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
             "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
         })
         assert changed.status_code == 200
+        assert changed.json()["evaluation_artifact_id"] is None
         replacement = client.post(
             f"/career-workspace/applications/{first['id']}/artifacts", headers=owner,
             json={"kind": "evaluation", "source": "career-ops",
@@ -192,6 +201,43 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
         saved = client.get(endpoint, headers=owner).json()
         assert saved[0]["id"] == snapshot["id"]
         assert saved[0]["entries"] == snapshot["entries"]
+
+
+def test_legacy_comparison_is_not_relabelled_as_artifact_bound():
+    from app.routers.career import _comparison_out
+
+    historical = CareerComparisonSnapshot(entries=[{"rank": 1, "fit_score": 85}])
+    assert _comparison_out(historical)["basis"] == "legacy_report_presence"
+
+
+def test_evaluation_score_binding_rejects_cross_user_wrong_role_and_invalid_report():
+    with TestClient(app) as client:
+        owner = headers(2101)
+        role = client.post("/career-workspace/applications", headers=owner,
+                           json={"company": "Bound", "role": "Engineer"}).json()
+        other = client.post("/career-workspace/applications", headers=owner,
+                            json={"company": "Other", "role": "Analyst"}).json()
+        report = client.post(f"/career-workspace/applications/{role['id']}/artifacts",
+                             headers=owner, json={"kind": "evaluation", "source": "career-ops",
+                                                  "content_markdown": "**Score:** 4/5\n## Score Evidence\nIncomplete"}).json()
+        path = f"/career-workspace/applications/{role['id']}/evaluation-score"
+        assert client.post(path, headers=headers(2102), json={"artifact_id": report["id"]}).status_code == 404
+        assert client.post(f"/career-workspace/applications/{other['id']}/evaluation-score",
+                           headers=owner, json={"artifact_id": report["id"]}).status_code == 404
+        assert client.post(path, headers=owner, json={"artifact_id": report["id"]}).status_code == 400
+        duplicate = client.post(f"/career-workspace/applications/{role['id']}/artifacts",
+                                headers=owner, json={"kind": "evaluation", "source": "career-ops",
+                                                     "content_markdown": "**Score:** 4/5\n**Score:** 5/5\n"
+                                                     "## Score Evidence\n"
+                                                     "| CV match | supported | Resume facts | Confirm skills |\n"
+                                                     "| North Star alignment | partial | Target role | Confirm scope |\n"
+                                                     "| Compensation | unknown | Pay absent | Ask salary |\n"
+                                                     "| Cultural signals | unknown | Team absent | Ask team |\n"
+                                                     "| Red flags | partial | Date absent | Check date |"}).json()
+        assert client.post(path, headers=owner, json={"artifact_id": duplicate["id"]}).status_code == 400
+        unchanged = client.get(f"/career-workspace/applications/{role['id']}", headers=owner).json()
+        assert unchanged["fit_score"] is None
+        assert unchanged["evaluation_artifact_id"] is None
 
 
 def test_applications_are_idempotent_and_user_isolated():
@@ -501,6 +547,21 @@ def test_auto_campaign_is_site_scoped_bounded_and_revocable():
             "job_url": "https://www.linkedin.com/jobs/view/999", "sources": ["career-ops"],
         }, headers=headers(3)).json()
         assert evaluated["fit_score"] == 95
+        assert client.post(endpoint, json={
+            "authorization_id": policy["id"], "idempotency_key": "unbound-evaluation-999",
+        }, headers=headers(3)).status_code == 403
+        report = client.post(f"/career-workspace/applications/{allowed['id']}/artifacts",
+                             headers=headers(3), json={"kind": "evaluation", "source": "career-ops",
+                                                      "content_markdown": "**Score:** 4.75/5\n## Score Evidence\n"
+                                                      "| CV match | supported | Resume facts | Confirm skills |\n"
+                                                      "| North Star alignment | partial | Target role | Confirm scope |\n"
+                                                      "| Compensation | unknown | Pay absent | Ask salary |\n"
+                                                      "| Cultural signals | unknown | Team absent | Ask team |\n"
+                                                      "| Red flags | partial | Date absent | Check date |"}).json()
+        bound = client.post(f"/career-workspace/applications/{allowed['id']}/evaluation-score",
+                            headers=headers(3), json={"artifact_id": report["id"]})
+        assert bound.status_code == 200, bound.text
+        assert bound.json()["fit_score"] == 95
         attempt = client.post(
             endpoint,
             json={"authorization_id": policy["id"], "idempotency_key": "allowed-site-999"},
