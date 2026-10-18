@@ -38,10 +38,13 @@ def test_existing_applications_gain_nullable_evaluation_binding():
             await connection.execute(text("INSERT INTO career_applications (id, fit_score) VALUES ('old', 85)"))
             await database.ensure_career_evaluation_binding(connection)
             await database.ensure_career_evaluation_binding(connection)
+            await database.ensure_career_evaluation_source_binding(connection)
+            await database.ensure_career_evaluation_source_binding(connection)
             result = await connection.execute(text(
-                "SELECT fit_score, evaluation_artifact_id FROM career_applications WHERE id = 'old'"
+                "SELECT fit_score, evaluation_artifact_id, evaluation_source_artifact_id "
+                "FROM career_applications WHERE id = 'old'"
             ))
-            assert result.one() == (85, None)
+            assert result.one() == (85, None, None)
         await engine.dispose()
 
     asyncio.run(check())
