@@ -9,6 +9,7 @@ import hashlib
 import secrets
 from ipaddress import ip_address
 from urllib.parse import urlsplit, urlunsplit
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -19,7 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.career_auth import career_user
 from app.database import get_db
 from app.models import (
-    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerComparisonSnapshot,
+    CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
 )
 
@@ -89,6 +91,10 @@ class CandidateProfileIn(BaseModel):
     target_roles: list[str] = Field(default_factory=list, max_length=20)
     skills: list[str] = Field(default_factory=list, max_length=100)
     resume_markdown: str = Field(default="", max_length=100000)
+
+
+class ComparisonIn(BaseModel):
+    application_ids: list[UUID] = Field(min_length=2, max_length=5)
 
 
 class StageFeedbackIn(BaseModel):
@@ -165,6 +171,11 @@ def _pipeline_out(item: CareerPipelineEntry) -> dict:
         "role": item.role, "status": item.status,
         "created_at": item.created_at, "updated_at": item.updated_at,
     }
+
+
+def _comparison_out(item: CareerComparisonSnapshot) -> dict:
+    return {"id": item.id, "entries": item.entries, "created_at": item.created_at,
+            "basis": "saved_evaluation_scores_only", "external_action": "none"}
 
 
 def _expiry(value: datetime) -> datetime:
@@ -477,6 +488,60 @@ async def list_pipeline(user_id: str = Depends(career_user), db: AsyncSession = 
         CareerPipelineEntry.user_id == user_id,
     ).order_by(CareerPipelineEntry.created_at.desc()))).scalars().all()
     return [_pipeline_out(row) for row in rows]
+
+
+@router.get("/comparisons")
+async def list_comparisons(user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(select(CareerComparisonSnapshot).where(
+        CareerComparisonSnapshot.user_id == user_id,
+    ).order_by(CareerComparisonSnapshot.created_at.desc(), CareerComparisonSnapshot.id.desc()).limit(20))).scalars().all()
+    return [_comparison_out(row) for row in rows]
+
+
+@router.post("/comparisons")
+async def create_comparison(
+    body: ComparisonIn, user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    ids = [str(value) for value in body.application_ids]
+    if len(set(ids)) != len(ids):
+        raise HTTPException(400, "Choose distinct applications")
+    applications = (await db.execute(select(CareerApplication).where(
+        CareerApplication.user_id == user_id, CareerApplication.id.in_(ids),
+    ))).scalars().all()
+    if len(applications) != len(ids):
+        raise HTTPException(404, "One or more applications were not found")
+    evaluations = (await db.execute(select(CareerArtifact).where(
+        CareerArtifact.user_id == user_id, CareerArtifact.application_id.in_(ids),
+        CareerArtifact.kind == "evaluation", CareerArtifact.source == "career-ops",
+    ).order_by(CareerArtifact.version.desc(), CareerArtifact.created_at.desc()))).scalars().all()
+    latest_evaluation = {}
+    for artifact in evaluations:
+        latest_evaluation.setdefault(artifact.application_id, artifact)
+    entries = []
+    for application in applications:
+        evidence = latest_evaluation.get(application.id)
+        ranked_score = application.fit_score if (
+            application.score_kind == "career_ops_evaluation" and evidence is not None
+        ) else None
+        entries.append({
+            "application_id": application.id, "company": application.company,
+            "role": application.role, "stage": application.stage,
+            "fit_score": ranked_score, "score_kind": application.score_kind,
+            "evaluation_artifact_id": evidence.id if ranked_score is not None else None,
+            "evaluation_version": evidence.version if ranked_score is not None else None,
+            "rank": None,
+        })
+    entries.sort(key=lambda item: (
+        item["fit_score"] is None, -(item["fit_score"] or 0),
+        item["company"].casefold(), item["role"].casefold(), item["application_id"],
+    ))
+    for rank, entry in enumerate((item for item in entries if item["fit_score"] is not None), start=1):
+        entry["rank"] = rank
+    snapshot = CareerComparisonSnapshot(user_id=user_id, entries=entries)
+    db.add(snapshot)
+    await db.commit()
+    await db.refresh(snapshot)
+    return _comparison_out(snapshot)
 
 
 @router.post("/pipeline")

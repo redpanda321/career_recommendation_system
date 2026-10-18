@@ -15,7 +15,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.database import AsyncSessionLocal, Base, engine
 from app.database import ensure_career_score_kind
 from app.models import (
-    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerComparisonSnapshot,
+    CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
 )
 from app.routers.career import router
@@ -44,7 +45,7 @@ def setup_module():
             await connection.run_sync(Base.metadata.create_all, tables=[
                 CareerApplication.__table__, CareerArtifact.__table__,
                 CareerCandidateProfile.__table__, CareerStageEvent.__table__, CareerContactEvent.__table__,
-                CareerPipelineEntry.__table__,
+                CareerPipelineEntry.__table__, CareerComparisonSnapshot.__table__,
                 SubmissionAuthorization.__table__, SubmissionAttempt.__table__,
             ])
     asyncio.run(create_tables())
@@ -111,6 +112,71 @@ def test_pipeline_is_database_owned_and_user_isolated(monkeypatch, tmp_path):
         assert activity["feedback"][0]["note"] == "Submitted myself"
         assert activity["artifacts"][0]["content_markdown"] == "# Reviewed"
         assert not (tmp_path / "unused").exists()
+
+
+def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores():
+    with TestClient(app) as client:
+        owner = headers(2001)
+        first = client.post("/career-workspace/applications", headers=owner, json={
+            "company": "Alpha", "role": "Engineer", "fit_score": 85,
+            "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
+        }).json()
+        second = client.post("/career-workspace/applications", headers=owner, json={
+            "company": "Beta", "role": "Engineer", "fit_score": 92,
+            "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
+        }).json()
+        preliminary = client.post("/career-workspace/applications", headers=owner, json={
+            "company": "Gamma", "role": "Engineer", "fit_score": 99,
+            "score_kind": "resume_overlap", "sources": ["ai-job-search"],
+        }).json()
+        missing_report = client.post("/career-workspace/applications", headers=owner, json={
+            "company": "Delta", "role": "Engineer", "fit_score": 97,
+            "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
+        }).json()
+        outsider = client.post("/career-workspace/applications", headers=headers(2002), json={
+            "company": "Private", "role": "Engineer",
+        }).json()
+        for application in (first, second):
+            response = client.post(
+                f"/career-workspace/applications/{application['id']}/artifacts",
+                headers=owner, json={"kind": "evaluation", "source": "career-ops",
+                                     "content_markdown": "# Candidate-reviewed evaluation"},
+            )
+            assert response.status_code == 200, response.text
+
+        endpoint = "/career-workspace/comparisons"
+        selected = [preliminary["id"], first["id"], second["id"], missing_report["id"]]
+        assert client.post(endpoint, headers=owner, json={
+            "application_ids": selected + [first["id"], second["id"]],
+        }).status_code == 422
+        assert client.post(endpoint, headers=owner, json={
+            "application_ids": [first["id"], first["id"]],
+        }).status_code == 400
+        assert client.post(endpoint, headers=owner, json={
+            "application_ids": [first["id"], outsider["id"]],
+        }).status_code == 404
+        response = client.post(endpoint, headers=owner, json={"application_ids": selected})
+        assert response.status_code == 200, response.text
+        snapshot = response.json()
+        assert snapshot["basis"] == "saved_evaluation_scores_only"
+        assert snapshot["external_action"] == "none"
+        assert [(entry["company"], entry["rank"], entry["fit_score"])
+                for entry in snapshot["entries"]] == [
+            ("Beta", 1, 92), ("Alpha", 2, 85),
+            ("Delta", None, None), ("Gamma", None, None),
+        ]
+        assert all(entry["evaluation_artifact_id"] for entry in snapshot["entries"][:2])
+        assert all(entry["evaluation_artifact_id"] is None for entry in snapshot["entries"][2:])
+        assert client.get(endpoint, headers=headers(2002)).json() == []
+
+        changed = client.post("/career-workspace/applications", headers=owner, json={
+            "company": "Alpha", "role": "Engineer", "fit_score": 70,
+            "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
+        })
+        assert changed.status_code == 200
+        saved = client.get(endpoint, headers=owner).json()
+        assert saved[0]["id"] == snapshot["id"]
+        assert saved[0]["entries"] == snapshot["entries"]
 
 
 def test_applications_are_idempotent_and_user_isolated():

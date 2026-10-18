@@ -238,6 +238,16 @@ async def list_canonical_pipeline(request: Request, _user: str = Depends(career_
     return await _forward(request, "pipeline", "GET")
 
 
+@router.get("/comparisons")
+async def list_canonical_comparisons(request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, "comparisons", "GET")
+
+
+@router.post("/comparisons")
+async def save_canonical_comparison(request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, "comparisons", "POST", await request.json())
+
+
 @router.post("/pipeline")
 async def save_canonical_pipeline_url(request: Request, _user: str = Depends(career_user)):
     return await _forward(request, "pipeline", "POST", await request.json())

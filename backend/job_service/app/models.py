@@ -95,6 +95,17 @@ class CareerCandidateProfile(Base):
     )
 
 
+class CareerComparisonSnapshot(Base):
+    """Immutable, candidate-owned comparison of observed application state."""
+
+    __tablename__ = "career_comparison_snapshots"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(80), nullable=False, index=True)
+    entries = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class CareerStageEvent(Base):
     """Append-only candidate feedback; not proof of an external submission."""
 

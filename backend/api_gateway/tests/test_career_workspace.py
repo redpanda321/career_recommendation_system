@@ -6,10 +6,16 @@ from app.routes.career_workspace import (
     ProficientlyRecord,
     WorkspaceImportRequest,
     build_workspace_preview,
+    router,
 )
 
 
 class CareerWorkspacePreviewTests(unittest.TestCase):
+    def test_canonical_comparison_routes_are_exposed(self):
+        routes = {(route.path, method) for route in router.routes for method in route.methods}
+        self.assertIn(("/comparisons", "GET"), routes)
+        self.assertIn(("/comparisons", "POST"), routes)
+
     def test_merges_same_role_and_uses_the_furthest_stage(self):
         preview = build_workspace_preview(WorkspaceImportRequest(
             ai_job_search=[AiJobSearchRecord(

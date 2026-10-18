@@ -38,6 +38,7 @@ jobs:
       - name: Career Python lint
         run: >-
           python -m ruff check --select F
+          backend/job_service/app/models.py
           backend/job_service/app/routers/career.py
           backend/job_service/tests/test_career.py
           backend/job_service/tests/test_career_migration.py

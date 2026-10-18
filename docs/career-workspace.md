@@ -14,6 +14,18 @@ matching URL processed. Existing career-ops Markdown files are read only during
 an explicit user-initiated import. They never overwrite database records during
 ordinary reads, and no shared server-side career-ops CLI writes user files.
 
+`GET/POST /career-workspace/comparisons` stores immutable, owner-scoped
+snapshots of 2–5 selected applications in `career_comparison_snapshots`.
+Only a saved `career_ops_evaluation` score with a linked versioned evaluation
+report is ranked; preliminary overlap/import scores remain visible as
+unranked. Each snapshot freezes role, company, stage, score, rank and report
+reference at creation time. It never changes an application, chooses a role,
+or authorizes submission. This is a comparison of recorded evaluations, not
+an independent verification of the underlying claims.
+The report reference proves only that an evaluation artifact exists for that
+application; older records do not cryptographically bind a score to a specific
+report version.
+
 The current adapters preserve their origins:
 
 | Source | Contribution |
