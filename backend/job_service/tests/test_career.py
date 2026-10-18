@@ -208,6 +208,20 @@ def test_source_observation_is_versioned_without_claiming_listing_liveness():
         assert client.get(f"{endpoint[:-10]}", headers=headers(65)).json()["stage"] == "saved"
 
 
+def test_liveness_evidence_does_not_change_stage_or_score():
+    with TestClient(app) as client:
+        application = client.post("/career-workspace/applications", headers=headers(67), json={
+            "company": "ATS Co", "role": "Engineer", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{application['id']}/artifacts"
+        body = {"kind": "liveness_check", "source": "hanggent",
+                "content_markdown": '{"status":"expired","method":"greenhouse_public_api"}'}
+        assert client.post(endpoint, headers=headers(67), json=body).status_code == 200
+        unchanged = client.get(f"{endpoint[:-10]}", headers=headers(67)).json()
+        assert unchanged["stage"] == "saved"
+        assert unchanged["fit_score"] is None
+
+
 def test_profile_and_feedback_are_candidate_scoped_and_auditable():
     with TestClient(app) as client:
         assert client.get("/career-workspace/profile", headers=headers(41)).json()["full_name"] == ""
