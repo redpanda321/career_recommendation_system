@@ -6,9 +6,11 @@ until a separate, authenticated browser worker records a verified outcome.
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import re
 import secrets
 from ipaddress import ip_address
 from urllib.parse import urlsplit, urlunsplit
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -17,9 +19,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.career_auth import career_user
+from app.comparison_evidence import parse_requirement_evidence, parse_score_evidence
 from app.database import get_db
 from app.models import (
-    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerComparisonSnapshot,
+    CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
 )
 
@@ -91,6 +95,14 @@ class CandidateProfileIn(BaseModel):
     resume_markdown: str = Field(default="", max_length=100000)
 
 
+class ComparisonIn(BaseModel):
+    application_ids: list[UUID] = Field(min_length=2, max_length=5)
+
+
+class EvaluationScoreIn(BaseModel):
+    artifact_id: UUID
+
+
 class StageFeedbackIn(BaseModel):
     stage: str
     note: str = Field(min_length=3, max_length=2000)
@@ -149,6 +161,7 @@ def _application_out(
         "id": item.id, "company": item.company, "role": item.role,
         "location": item.location, "job_url": item.job_url, "stage": item.stage,
         "fit_score": item.fit_score, "score_kind": item.score_kind,
+        "evaluation_artifact_id": item.evaluation_artifact_id,
         "sources": item.sources, "notes": item.notes,
         "created_at": item.created_at, "updated_at": item.updated_at,
         "submission_blocked": blocking_attempt is not None,
@@ -165,6 +178,13 @@ def _pipeline_out(item: CareerPipelineEntry) -> dict:
         "role": item.role, "status": item.status,
         "created_at": item.created_at, "updated_at": item.updated_at,
     }
+
+
+def _comparison_out(item: CareerComparisonSnapshot) -> dict:
+    bound = all(entry.get("score_provenance") in {"artifact_bound", "unranked"} for entry in item.entries)
+    return {"id": item.id, "entries": item.entries, "created_at": item.created_at,
+            "basis": "bound_evaluation_scores_only" if bound else "legacy_report_presence",
+            "external_action": "none"}
 
 
 def _expiry(value: datetime) -> datetime:
@@ -479,6 +499,64 @@ async def list_pipeline(user_id: str = Depends(career_user), db: AsyncSession = 
     return [_pipeline_out(row) for row in rows]
 
 
+@router.get("/comparisons")
+async def list_comparisons(user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(select(CareerComparisonSnapshot).where(
+        CareerComparisonSnapshot.user_id == user_id,
+    ).order_by(CareerComparisonSnapshot.created_at.desc(), CareerComparisonSnapshot.id.desc()).limit(20))).scalars().all()
+    return [_comparison_out(row) for row in rows]
+
+
+@router.post("/comparisons")
+async def create_comparison(
+    body: ComparisonIn, user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    ids = [str(value) for value in body.application_ids]
+    if len(set(ids)) != len(ids):
+        raise HTTPException(400, "Choose distinct applications")
+    applications = (await db.execute(select(CareerApplication).where(
+        CareerApplication.user_id == user_id, CareerApplication.id.in_(ids),
+    ))).scalars().all()
+    if len(applications) != len(ids):
+        raise HTTPException(404, "One or more applications were not found")
+    bound_ids = [item.evaluation_artifact_id for item in applications if item.evaluation_artifact_id]
+    evaluations = (await db.execute(select(CareerArtifact).where(
+        CareerArtifact.user_id == user_id, CareerArtifact.id.in_(bound_ids),
+        CareerArtifact.kind == "evaluation", CareerArtifact.source == "career-ops",
+    ))).scalars().all()
+    bound_evaluation = {artifact.id: artifact for artifact in evaluations}
+    entries = []
+    for application in applications:
+        evidence = bound_evaluation.get(application.evaluation_artifact_id)
+        ranked_score = application.fit_score if (
+            application.score_kind == "career_ops_evaluation" and evidence is not None
+            and evidence.application_id == application.id
+        ) else None
+        entries.append({
+            "application_id": application.id, "company": application.company,
+            "role": application.role, "stage": application.stage,
+            "fit_score": ranked_score, "score_kind": application.score_kind,
+            "evaluation_artifact_id": evidence.id if ranked_score is not None else None,
+            "evaluation_version": evidence.version if ranked_score is not None else None,
+            "score_evidence": parse_score_evidence(evidence.content_markdown) if ranked_score is not None else None,
+            "requirement_evidence": parse_requirement_evidence(evidence.content_markdown)
+            if ranked_score is not None else None,
+            "score_provenance": "artifact_bound" if ranked_score is not None else "unranked",
+            "rank": None,
+        })
+    entries.sort(key=lambda item: (
+        item["fit_score"] is None, -(item["fit_score"] or 0),
+        item["company"].casefold(), item["role"].casefold(), item["application_id"],
+    ))
+    for rank, entry in enumerate((item for item in entries if item["fit_score"] is not None), start=1):
+        entry["rank"] = rank
+    snapshot = CareerComparisonSnapshot(user_id=user_id, entries=entries)
+    db.add(snapshot)
+    await db.commit()
+    await db.refresh(snapshot)
+    return _comparison_out(snapshot)
+
+
 @router.post("/pipeline")
 async def queue_pipeline_url(
     body: PipelineIn, user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
@@ -570,6 +648,7 @@ async def upsert_application(
         if body.score_kind == "career_ops_evaluation":
             row.fit_score = body.fit_score
             row.score_kind = body.score_kind
+            row.evaluation_artifact_id = None
         elif body.score_kind == "career_ops_import" and row.score_kind != "career_ops_evaluation":
             row.fit_score = body.fit_score
             row.score_kind = body.score_kind
@@ -597,6 +676,37 @@ async def upsert_application(
         raise HTTPException(409, "Application was concurrently imported; retry") from exc
     await db.refresh(row)
     return _application_out(row)
+
+
+@router.post("/applications/{application_id}/evaluation-score")
+async def bind_evaluation_score(
+    application_id: str, body: EvaluationScoreIn,
+    user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    """Atomically score a role from one owned report; no caller-supplied score."""
+    application = (await db.execute(select(CareerApplication).where(
+        CareerApplication.id == application_id, CareerApplication.user_id == user_id,
+    ))).scalar_one_or_none()
+    artifact = (await db.execute(select(CareerArtifact).where(
+        CareerArtifact.id == str(body.artifact_id), CareerArtifact.application_id == application_id,
+        CareerArtifact.user_id == user_id, CareerArtifact.kind == "evaluation",
+        CareerArtifact.source == "career-ops",
+    ))).scalar_one_or_none()
+    if application is None or artifact is None:
+        raise HTTPException(404, "Application or evaluation report not found")
+    score_matches = re.findall(r"^\*\*Score:\*\*\s*([1-5](?:\.\d+)?)\s*/\s*5\s*$",
+                               artifact.content_markdown, flags=re.MULTILINE)
+    if len(score_matches) != 1 or not 1 <= float(score_matches[0]) <= 5:
+        raise HTTPException(400, "Evaluation report has no valid 1-5 score")
+    if parse_score_evidence(artifact.content_markdown) is None:
+        raise HTTPException(400, "Evaluation report has no complete score evidence")
+    application.fit_score = round(float(score_matches[0]) * 20, 2)
+    application.score_kind = "career_ops_evaluation"
+    application.evaluation_artifact_id = artifact.id
+    application.sources = sorted(set(application.sources or []) | {"career-ops"})
+    await db.commit()
+    await db.refresh(application)
+    return _application_out(application)
 
 
 @router.post("/applications/{application_id}/artifacts")
@@ -705,6 +815,7 @@ async def queue_submission(
         raise HTTPException(403, "Authorization is for another application")
     if policy.mode == "auto" and (
         application.score_kind != "career_ops_evaluation"
+        or application.evaluation_artifact_id is None
         or application.fit_score is None or application.fit_score < policy.min_fit_score
     ):
         raise HTTPException(403, "Job does not meet the authorized fit threshold")

@@ -4,9 +4,11 @@ on:
   pull_request:
     paths:
       - 'backend/job_service/app/routers/career.py'
+      - 'backend/job_service/app/comparison_evidence.py'
       - 'backend/job_service/app/models.py'
       - 'backend/job_service/app/database.py'
       - 'backend/job_service/tests/test_career*.py'
+      - 'backend/job_service/tests/test_comparison_evidence.py'
       - 'backend/api_gateway/app/routes/career*.py'
       - 'backend/api_gateway/tests/test_career*.py'
       - '.github/workflows/career-workspace-checks.yml'
@@ -35,12 +37,16 @@ jobs:
           python -m pytest -q
           backend/job_service/tests/test_career.py
           backend/job_service/tests/test_career_migration.py
+          backend/job_service/tests/test_comparison_evidence.py
       - name: Career Python lint
         run: >-
           python -m ruff check --select F
+          backend/job_service/app/models.py
           backend/job_service/app/routers/career.py
+          backend/job_service/app/comparison_evidence.py
           backend/job_service/tests/test_career.py
           backend/job_service/tests/test_career_migration.py
+          backend/job_service/tests/test_comparison_evidence.py
 
   api-gateway:
     runs-on: ubuntu-latest

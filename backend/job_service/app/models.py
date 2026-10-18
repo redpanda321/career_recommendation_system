@@ -49,6 +49,7 @@ class CareerApplication(Base):
     stage = Column(String(32), nullable=False, default="saved")
     fit_score = Column(Float)
     score_kind = Column(String(32), nullable=False, default="unverified")
+    evaluation_artifact_id = Column(String(36))
     sources = Column(JSON, nullable=False, default=list)
     notes = Column(JSON, nullable=False, default=list)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -93,6 +94,17 @@ class CareerCandidateProfile(Base):
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class CareerComparisonSnapshot(Base):
+    """Immutable, candidate-owned comparison of observed application state."""
+
+    __tablename__ = "career_comparison_snapshots"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(80), nullable=False, index=True)
+    entries = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class CareerStageEvent(Base):

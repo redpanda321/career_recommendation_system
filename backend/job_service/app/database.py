@@ -21,6 +21,7 @@ async def create_db_and_tables():
         await conn.run_sync(Base.metadata.create_all)
         await ensure_submission_worker_columns(conn)
         await ensure_career_score_kind(conn)
+        await ensure_career_evaluation_binding(conn)
 
 
 async def ensure_submission_worker_columns(conn):
@@ -52,6 +53,19 @@ async def ensure_career_score_kind(conn):
         await conn.exec_driver_sql(
             "ALTER TABLE career_applications ADD COLUMN "
             f"{optional}score_kind VARCHAR(32) NOT NULL DEFAULT 'unverified'"
+        )
+
+
+async def ensure_career_evaluation_binding(conn):
+    """Historical scores remain unbound until a new report is explicitly scored."""
+    columns = await conn.run_sync(lambda sync_conn: {
+        column["name"] for column in inspect(sync_conn).get_columns("career_applications")
+    })
+    if "evaluation_artifact_id" not in columns:
+        optional = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
+        await conn.exec_driver_sql(
+            "ALTER TABLE career_applications ADD COLUMN "
+            f"{optional}evaluation_artifact_id VARCHAR(36)"
         )
 
 # Dependency for FastAPI routes

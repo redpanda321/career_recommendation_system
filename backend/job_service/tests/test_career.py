@@ -15,7 +15,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.database import AsyncSessionLocal, Base, engine
 from app.database import ensure_career_score_kind
 from app.models import (
-    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerComparisonSnapshot,
+    CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
 )
 from app.routers.career import router
@@ -44,7 +45,7 @@ def setup_module():
             await connection.run_sync(Base.metadata.create_all, tables=[
                 CareerApplication.__table__, CareerArtifact.__table__,
                 CareerCandidateProfile.__table__, CareerStageEvent.__table__, CareerContactEvent.__table__,
-                CareerPipelineEntry.__table__,
+                CareerPipelineEntry.__table__, CareerComparisonSnapshot.__table__,
                 SubmissionAuthorization.__table__, SubmissionAttempt.__table__,
             ])
     asyncio.run(create_tables())
@@ -111,6 +112,140 @@ def test_pipeline_is_database_owned_and_user_isolated(monkeypatch, tmp_path):
         assert activity["feedback"][0]["note"] == "Submitted myself"
         assert activity["artifacts"][0]["content_markdown"] == "# Reviewed"
         assert not (tmp_path / "unused").exists()
+
+
+def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores():
+    with TestClient(app) as client:
+        owner = headers(2001)
+        first = client.post("/career-workspace/applications", headers=owner, json={
+            "company": "Alpha", "role": "Engineer", "fit_score": 10,
+            "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
+        }).json()
+        second = client.post("/career-workspace/applications", headers=owner, json={
+            "company": "Beta", "role": "Engineer", "fit_score": 20,
+            "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
+        }).json()
+        preliminary = client.post("/career-workspace/applications", headers=owner, json={
+            "company": "Gamma", "role": "Engineer", "fit_score": 99,
+            "score_kind": "resume_overlap", "sources": ["ai-job-search"],
+        }).json()
+        missing_report = client.post("/career-workspace/applications", headers=owner, json={
+            "company": "Delta", "role": "Engineer", "fit_score": 97,
+            "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
+        }).json()
+        outsider = client.post("/career-workspace/applications", headers=headers(2002), json={
+            "company": "Private", "role": "Engineer",
+        }).json()
+        for application, report_score in ((first, "4.25"), (second, "4.6")):
+            response = client.post(
+                f"/career-workspace/applications/{application['id']}/artifacts",
+                headers=owner, json={"kind": "evaluation", "source": "career-ops",
+                                     "content_markdown": f"**Score:** {report_score}/5\n"
+                                     "## B) Match with CV\n"
+                                     "| Requirement | Importance | Match | JD signal | Evidence / gap |\n"
+                                     "| --- | --- | --- | --- | --- |\n"
+                                     "| Python services | high (structural) | ✅ Strong | Responsibilities: Python services | CV: Built Python APIs |\n"
+                                     "## C) Level and Strategy\nContext.\n## Score Evidence\n"
+                                     "| Dimension | Status | Observation | Open question |\n"
+                                     "| CV match | supported | Resume names Python. | Confirm depth. |\n"
+                                     "| North Star alignment | partial | Target role matches. | Confirm scope. |\n"
+                                     "| Compensation | unknown | Pay missing. | Ask salary. |\n"
+                                     "| Cultural signals | unknown | Culture missing. | Ask team. |\n"
+                                     "| Red flags | partial | Posting age unknown. | Check liveness. |"},
+            )
+            assert response.status_code == 200, response.text
+            bound = client.post(
+                f"/career-workspace/applications/{application['id']}/evaluation-score",
+                headers=owner, json={"artifact_id": response.json()["id"]},
+            )
+            assert bound.status_code == 200, bound.text
+            assert bound.json()["fit_score"] == float(report_score) * 20
+            assert bound.json()["evaluation_artifact_id"] == response.json()["id"]
+
+        endpoint = "/career-workspace/comparisons"
+        selected = [preliminary["id"], first["id"], second["id"], missing_report["id"]]
+        assert client.post(endpoint, headers=owner, json={
+            "application_ids": selected + [first["id"], second["id"]],
+        }).status_code == 422
+        assert client.post(endpoint, headers=owner, json={
+            "application_ids": [first["id"], first["id"]],
+        }).status_code == 400
+        assert client.post(endpoint, headers=owner, json={
+            "application_ids": [first["id"], outsider["id"]],
+        }).status_code == 404
+        response = client.post(endpoint, headers=owner, json={"application_ids": selected})
+        assert response.status_code == 200, response.text
+        snapshot = response.json()
+        assert snapshot["basis"] == "bound_evaluation_scores_only"
+        assert snapshot["external_action"] == "none"
+        assert [(entry["company"], entry["rank"], entry["fit_score"])
+                for entry in snapshot["entries"]] == [
+            ("Beta", 1, 92), ("Alpha", 2, 85),
+            ("Delta", None, None), ("Gamma", None, None),
+        ]
+        assert all(entry["evaluation_artifact_id"] for entry in snapshot["entries"][:2])
+        assert all(entry["score_provenance"] == "artifact_bound" for entry in snapshot["entries"][:2])
+        assert all(len(entry["score_evidence"]) == 5 for entry in snapshot["entries"][:2])
+        assert all(entry["requirement_evidence"][0]["requirement"] == "Python services"
+                   for entry in snapshot["entries"][:2])
+        assert snapshot["entries"][0]["score_evidence"][2]["status"] == "unknown"
+        assert all(entry["evaluation_artifact_id"] is None for entry in snapshot["entries"][2:])
+        assert all(entry["score_evidence"] is None for entry in snapshot["entries"][2:])
+        assert all(entry["requirement_evidence"] is None for entry in snapshot["entries"][2:])
+        assert client.get(endpoint, headers=headers(2002)).json() == []
+
+        changed = client.post("/career-workspace/applications", headers=owner, json={
+            "company": "Alpha", "role": "Engineer", "fit_score": 70,
+            "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
+        })
+        assert changed.status_code == 200
+        assert changed.json()["evaluation_artifact_id"] is None
+        replacement = client.post(
+            f"/career-workspace/applications/{first['id']}/artifacts", headers=owner,
+            json={"kind": "evaluation", "source": "career-ops",
+                  "content_markdown": "## Score Evidence\nIncomplete replacement report"},
+        )
+        assert replacement.status_code == 200
+        saved = client.get(endpoint, headers=owner).json()
+        assert saved[0]["id"] == snapshot["id"]
+        assert saved[0]["entries"] == snapshot["entries"]
+
+
+def test_legacy_comparison_is_not_relabelled_as_artifact_bound():
+    from app.routers.career import _comparison_out
+
+    historical = CareerComparisonSnapshot(entries=[{"rank": 1, "fit_score": 85}])
+    assert _comparison_out(historical)["basis"] == "legacy_report_presence"
+
+
+def test_evaluation_score_binding_rejects_cross_user_wrong_role_and_invalid_report():
+    with TestClient(app) as client:
+        owner = headers(2101)
+        role = client.post("/career-workspace/applications", headers=owner,
+                           json={"company": "Bound", "role": "Engineer"}).json()
+        other = client.post("/career-workspace/applications", headers=owner,
+                            json={"company": "Other", "role": "Analyst"}).json()
+        report = client.post(f"/career-workspace/applications/{role['id']}/artifacts",
+                             headers=owner, json={"kind": "evaluation", "source": "career-ops",
+                                                  "content_markdown": "**Score:** 4/5\n## Score Evidence\nIncomplete"}).json()
+        path = f"/career-workspace/applications/{role['id']}/evaluation-score"
+        assert client.post(path, headers=headers(2102), json={"artifact_id": report["id"]}).status_code == 404
+        assert client.post(f"/career-workspace/applications/{other['id']}/evaluation-score",
+                           headers=owner, json={"artifact_id": report["id"]}).status_code == 404
+        assert client.post(path, headers=owner, json={"artifact_id": report["id"]}).status_code == 400
+        duplicate = client.post(f"/career-workspace/applications/{role['id']}/artifacts",
+                                headers=owner, json={"kind": "evaluation", "source": "career-ops",
+                                                     "content_markdown": "**Score:** 4/5\n**Score:** 5/5\n"
+                                                     "## Score Evidence\n"
+                                                     "| CV match | supported | Resume facts | Confirm skills |\n"
+                                                     "| North Star alignment | partial | Target role | Confirm scope |\n"
+                                                     "| Compensation | unknown | Pay absent | Ask salary |\n"
+                                                     "| Cultural signals | unknown | Team absent | Ask team |\n"
+                                                     "| Red flags | partial | Date absent | Check date |"}).json()
+        assert client.post(path, headers=owner, json={"artifact_id": duplicate["id"]}).status_code == 400
+        unchanged = client.get(f"/career-workspace/applications/{role['id']}", headers=owner).json()
+        assert unchanged["fit_score"] is None
+        assert unchanged["evaluation_artifact_id"] is None
 
 
 def test_applications_are_idempotent_and_user_isolated():
@@ -420,6 +555,21 @@ def test_auto_campaign_is_site_scoped_bounded_and_revocable():
             "job_url": "https://www.linkedin.com/jobs/view/999", "sources": ["career-ops"],
         }, headers=headers(3)).json()
         assert evaluated["fit_score"] == 95
+        assert client.post(endpoint, json={
+            "authorization_id": policy["id"], "idempotency_key": "unbound-evaluation-999",
+        }, headers=headers(3)).status_code == 403
+        report = client.post(f"/career-workspace/applications/{allowed['id']}/artifacts",
+                             headers=headers(3), json={"kind": "evaluation", "source": "career-ops",
+                                                      "content_markdown": "**Score:** 4.75/5\n## Score Evidence\n"
+                                                      "| CV match | supported | Resume facts | Confirm skills |\n"
+                                                      "| North Star alignment | partial | Target role | Confirm scope |\n"
+                                                      "| Compensation | unknown | Pay absent | Ask salary |\n"
+                                                      "| Cultural signals | unknown | Team absent | Ask team |\n"
+                                                      "| Red flags | partial | Date absent | Check date |"}).json()
+        bound = client.post(f"/career-workspace/applications/{allowed['id']}/evaluation-score",
+                            headers=headers(3), json={"artifact_id": report["id"]})
+        assert bound.status_code == 200, bound.text
+        assert bound.json()["fit_score"] == 95
         attempt = client.post(
             endpoint,
             json={"authorization_id": policy["id"], "idempotency_key": "allowed-site-999"},

@@ -14,6 +14,32 @@ matching URL processed. Existing career-ops Markdown files are read only during
 an explicit user-initiated import. They never overwrite database records during
 ordinary reads, and no shared server-side career-ops CLI writes user files.
 
+`GET/POST /career-workspace/comparisons` stores immutable, owner-scoped
+snapshots of 2–5 selected applications in `career_comparison_snapshots`.
+Only a `career_ops_evaluation` score explicitly bound to one owned, versioned
+report is ranked; preliminary, historical unbound and import scores remain
+visible as unranked. The bind endpoint derives the score from that report
+and writes score and artifact ID together; ordinary application upserts clear
+the binding when replacing an evaluation score. Each snapshot freezes role,
+company, stage, score, rank and report
+reference and, when parseable, bounded five-dimension score-evidence excerpts
+at creation time. Reports without the complete canonical table retain a null
+evidence field instead of invented claims. These excerpts are generated report
+claims for review, not independently verified evidence. It never changes an application, chooses a role,
+or authorizes submission. This is a comparison of recorded evaluations, not
+an independent verification of the underlying claims.
+The same snapshot extracts at most 20 rows from career-ops Block B's single
+requirement matrix (requirement, importance and evidence tier, match, JD signal,
+candidate evidence or gap). Malformed or older reports retain null requirement
+evidence. The API does not invent a second matrix or verify that quoted report
+text appears in a source document; candidates must review the JD and resume.
+Historical snapshots created before this change retain a legacy provenance
+label: those older records only proved that an evaluation artifact existed,
+not that it produced the saved score.
+Automatic submission authorization also requires a bound evaluation score;
+older unbound scores must be re-evaluated before they can meet an auto-mode
+fit threshold. Per-application `confirm_each` authorization is unchanged.
+
 The current adapters preserve their origins:
 
 | Source | Contribution |

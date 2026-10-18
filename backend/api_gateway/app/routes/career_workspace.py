@@ -238,6 +238,16 @@ async def list_canonical_pipeline(request: Request, _user: str = Depends(career_
     return await _forward(request, "pipeline", "GET")
 
 
+@router.get("/comparisons")
+async def list_canonical_comparisons(request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, "comparisons", "GET")
+
+
+@router.post("/comparisons")
+async def save_canonical_comparison(request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, "comparisons", "POST", await request.json())
+
+
 @router.post("/pipeline")
 async def save_canonical_pipeline_url(request: Request, _user: str = Depends(career_user)):
     return await _forward(request, "pipeline", "POST", await request.json())
@@ -301,6 +311,13 @@ async def import_career_records(
 @router.post("/applications/{application_id}/artifacts")
 async def save_career_artifact(application_id: str, request: Request, _user: str = Depends(career_user)):
     return await _forward(request, f"applications/{application_id}/artifacts", "POST", await request.json())
+
+
+@router.post("/applications/{application_id}/evaluation-score")
+async def bind_canonical_evaluation_score(
+    application_id: str, request: Request, _user: str = Depends(career_user),
+):
+    return await _forward(request, f"applications/{application_id}/evaluation-score", "POST", await request.json())
 
 
 @router.post("/authorizations")
