@@ -193,6 +193,21 @@ def test_research_task_link_metadata_is_owner_scoped_and_versioned():
         assert client.get(f"{endpoint[:-10]}", headers=headers(63)).json()["stage"] == "saved"
 
 
+def test_source_observation_is_versioned_without_claiming_listing_liveness():
+    with TestClient(app) as client:
+        application = client.post("/career-workspace/applications", headers=headers(65), json={
+            "company": "Source Co", "role": "Engineer", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{application['id']}/artifacts"
+        body = {"kind": "source_observation", "source": "career-compass",
+                "content_markdown": '{"site":"indeed","observed_at":"2026-10-18T00:00:00+00:00","liveness":"unchecked"}'}
+        assert client.post(endpoint, headers=headers(66), json=body).status_code == 404
+        response = client.post(endpoint, headers=headers(65), json=body)
+        assert response.status_code == 200, response.text
+        assert response.json()["version"] == 1
+        assert client.get(f"{endpoint[:-10]}", headers=headers(65)).json()["stage"] == "saved"
+
+
 def test_profile_and_feedback_are_candidate_scoped_and_auditable():
     with TestClient(app) as client:
         assert client.get("/career-workspace/profile", headers=headers(41)).json()["full_name"] == ""
