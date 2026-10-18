@@ -19,7 +19,10 @@ snapshots of 2–5 selected applications in `career_comparison_snapshots`.
 Only a saved `career_ops_evaluation` score with a linked versioned evaluation
 report is ranked; preliminary overlap/import scores remain visible as
 unranked. Each snapshot freezes role, company, stage, score, rank and report
-reference at creation time. It never changes an application, chooses a role,
+reference and, when parseable, bounded five-dimension score-evidence excerpts
+at creation time. Reports without the complete canonical table retain a null
+evidence field instead of invented claims. These excerpts are generated report
+claims for review, not independently verified evidence. It never changes an application, chooses a role,
 or authorizes submission. This is a comparison of recorded evaluations, not
 an independent verification of the underlying claims.
 The report reference proves only that an evaluation artifact exists for that

@@ -140,7 +140,13 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
             response = client.post(
                 f"/career-workspace/applications/{application['id']}/artifacts",
                 headers=owner, json={"kind": "evaluation", "source": "career-ops",
-                                     "content_markdown": "# Candidate-reviewed evaluation"},
+                                     "content_markdown": "## Score Evidence\n"
+                                     "| Dimension | Status | Observation | Open question |\n"
+                                     "| CV match | supported | Resume names Python. | Confirm depth. |\n"
+                                     "| North Star alignment | partial | Target role matches. | Confirm scope. |\n"
+                                     "| Compensation | unknown | Pay missing. | Ask salary. |\n"
+                                     "| Cultural signals | unknown | Culture missing. | Ask team. |\n"
+                                     "| Red flags | partial | Posting age unknown. | Check liveness. |"},
             )
             assert response.status_code == 200, response.text
 
@@ -166,7 +172,10 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
             ("Delta", None, None), ("Gamma", None, None),
         ]
         assert all(entry["evaluation_artifact_id"] for entry in snapshot["entries"][:2])
+        assert all(len(entry["score_evidence"]) == 5 for entry in snapshot["entries"][:2])
+        assert snapshot["entries"][0]["score_evidence"][2]["status"] == "unknown"
         assert all(entry["evaluation_artifact_id"] is None for entry in snapshot["entries"][2:])
+        assert all(entry["score_evidence"] is None for entry in snapshot["entries"][2:])
         assert client.get(endpoint, headers=headers(2002)).json() == []
 
         changed = client.post("/career-workspace/applications", headers=owner, json={
@@ -174,6 +183,12 @@ def test_comparison_snapshots_are_owned_immutable_and_rank_only_reported_scores(
             "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
         })
         assert changed.status_code == 200
+        replacement = client.post(
+            f"/career-workspace/applications/{first['id']}/artifacts", headers=owner,
+            json={"kind": "evaluation", "source": "career-ops",
+                  "content_markdown": "## Score Evidence\nIncomplete replacement report"},
+        )
+        assert replacement.status_code == 200
         saved = client.get(endpoint, headers=owner).json()
         assert saved[0]["id"] == snapshot["id"]
         assert saved[0]["entries"] == snapshot["entries"]
