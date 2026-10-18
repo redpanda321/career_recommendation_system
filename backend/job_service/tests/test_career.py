@@ -10,9 +10,14 @@ os.environ.setdefault("SECRET_KEY", "test-career-bridge-secret")
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from jose import jwt
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.database import AsyncSessionLocal, Base, engine
-from app.models import CareerApplication, CareerArtifact, SubmissionAuthorization, SubmissionAttempt
+from app.database import ensure_career_score_kind
+from app.models import (
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
+    SubmissionAuthorization, SubmissionAttempt,
+)
 from app.routers.career import router
 
 
@@ -38,9 +43,15 @@ def setup_module():
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all, tables=[
                 CareerApplication.__table__, CareerArtifact.__table__,
+                CareerCandidateProfile.__table__, CareerStageEvent.__table__, CareerContactEvent.__table__,
+                CareerPipelineEntry.__table__,
                 SubmissionAuthorization.__table__, SubmissionAttempt.__table__,
             ])
     asyncio.run(create_tables())
+
+
+def teardown_module():
+    asyncio.run(engine.dispose())
 
 
 def test_requires_scoped_bridge_identity():
@@ -50,6 +61,56 @@ def test_requires_scoped_bridge_identity():
         assert client.get("/career-workspace/applications", headers={
             "Authorization": f"Bearer {ordinary}",
         }).status_code == 401
+
+
+def test_pipeline_is_database_owned_and_user_isolated(monkeypatch, tmp_path):
+    # A leftover file-root setting must not redirect the canonical write path.
+    monkeypatch.setenv("CAREER_OPS_DATA_ROOT", str(tmp_path / "unused"))
+    with TestClient(app) as client:
+        url = "https://jobs.example.com/acme/991"
+        queued = client.post("/career-workspace/pipeline", headers=headers(991), json={
+            "job_url": url, "company": "Acme", "role": "Engineer",
+        })
+        assert queued.status_code == 200, queued.text
+        repeated = client.post("/career-workspace/pipeline", headers=headers(991), json={
+            "job_url": url, "company": "Acme", "role": "Engineer",
+        })
+        assert repeated.status_code == 200 and repeated.json()["id"] == queued.json()["id"]
+        assert len(client.get("/career-workspace/pipeline", headers=headers(991)).json()) == 1
+        assert client.get("/career-workspace/pipeline", headers=headers(992)).json() == []
+
+        evaluated = client.post("/career-workspace/applications", headers=headers(991), json={
+            "company": "Acme", "role": "Engineer", "job_url": url,
+            "fit_score": 88, "score_kind": "career_ops_evaluation", "sources": ["career-ops"],
+        })
+        assert evaluated.status_code == 200, evaluated.text
+        assert client.get("/career-workspace/pipeline", headers=headers(991)).json()[0]["status"] == "processed"
+        assert not (tmp_path / "unused").exists()
+
+        saved_profile = client.put("/career-workspace/profile", headers=headers(991), json={
+            "full_name": "Alex", "resume_markdown": "# CV",
+        })
+        assert saved_profile.status_code == 200
+        assert client.get("/career-workspace/profile", headers=headers(991)).json()["full_name"] == "Alex"
+        feedback = client.post(
+            f"/career-workspace/applications/{evaluated.json()['id']}/feedback",
+            headers=headers(991), json={"stage": "applied", "note": "Submitted myself"},
+        )
+        assert feedback.status_code == 200
+        material = client.post(
+            f"/career-workspace/applications/{evaluated.json()['id']}/artifacts",
+            headers=headers(991), json={
+                "kind": "cover_letter", "source": "career-ops", "content_markdown": "# Reviewed",
+            },
+        )
+        assert material.status_code == 200
+        activity = client.get(
+            f"/career-workspace/applications/{evaluated.json()['id']}/activity",
+            headers=headers(991),
+        ).json()
+        assert activity["feedback"][0]["note"] == "Submitted myself"
+        assert activity["artifacts"][0]["content_markdown"] == "# Reviewed"
+        assert not (tmp_path / "unused").exists()
 
 
 def test_applications_are_idempotent_and_user_isolated():
@@ -89,6 +150,179 @@ def test_applications_are_idempotent_and_user_isolated():
             f"/career-workspace/applications/{first.json()['id']}/activity", headers=headers(1)
         ).json()
         assert len(activity["artifacts"]) == 1
+
+
+def test_reviewed_research_is_versioned_and_does_not_change_application():
+    with TestClient(app) as client:
+        application = client.post("/career-workspace/applications", headers=headers(61), json={
+            "company": "Research Co", "role": "Engineer", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{application['id']}/artifacts"
+        body = {"kind": "research", "source": "hanggent", "content_markdown": "# Reviewed job research\nSource: company website"}
+        assert client.post(endpoint, headers=headers(62), json=body).status_code == 404
+        first = client.post(endpoint, headers=headers(61), json=body)
+        second = client.post(endpoint, headers=headers(61), json={
+            **body, "content_markdown": "# Corrected research\nSource: company website",
+        })
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert (first.json()["version"], second.json()["version"]) == (1, 2)
+        activity = client.get(f"{endpoint[:-10]}/activity", headers=headers(61)).json()
+        assert sorted(artifact["version"] for artifact in activity["artifacts"] if artifact["kind"] == "research") == [1, 2]
+        assert activity["submission_attempts"] == []
+        unchanged = client.get(f"{endpoint[:-10]}", headers=headers(61)).json()
+        assert unchanged["stage"] == "saved"
+        assert unchanged["fit_score"] is None
+
+
+def test_research_task_link_metadata_is_owner_scoped_and_versioned():
+    with TestClient(app) as client:
+        application = client.post("/career-workspace/applications", headers=headers(63), json={
+            "company": "Task Link Co", "role": "Engineer", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{application['id']}/artifacts"
+        body = {"kind": "research_task_link", "source": "hanggent",
+                "content_markdown": '{"project_id":"project-1","task_id":"task-1"}'}
+        assert client.post(endpoint, headers=headers(64), json=body).status_code == 404
+        response = client.post(endpoint, headers=headers(63), json=body)
+        assert response.status_code == 200, response.text
+        assert response.json()["version"] == 1
+        activity = client.get(f"{endpoint[:-10]}/activity", headers=headers(63)).json()
+        assert activity["artifacts"][0]["content_markdown"] == body["content_markdown"]
+        assert activity["submission_attempts"] == []
+        assert client.get(f"{endpoint[:-10]}", headers=headers(63)).json()["stage"] == "saved"
+
+
+def test_source_observation_is_versioned_without_claiming_listing_liveness():
+    with TestClient(app) as client:
+        application = client.post("/career-workspace/applications", headers=headers(65), json={
+            "company": "Source Co", "role": "Engineer", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{application['id']}/artifacts"
+        body = {"kind": "source_observation", "source": "career-compass",
+                "content_markdown": '{"site":"indeed","observed_at":"2026-10-18T00:00:00+00:00","liveness":"unchecked"}'}
+        assert client.post(endpoint, headers=headers(66), json=body).status_code == 404
+        response = client.post(endpoint, headers=headers(65), json=body)
+        assert response.status_code == 200, response.text
+        assert response.json()["version"] == 1
+        assert client.get(f"{endpoint[:-10]}", headers=headers(65)).json()["stage"] == "saved"
+
+
+def test_liveness_evidence_does_not_change_stage_or_score():
+    with TestClient(app) as client:
+        application = client.post("/career-workspace/applications", headers=headers(67), json={
+            "company": "ATS Co", "role": "Engineer", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{application['id']}/artifacts"
+        body = {"kind": "liveness_check", "source": "hanggent",
+                "content_markdown": '{"status":"expired","method":"greenhouse_public_api"}'}
+        assert client.post(endpoint, headers=headers(67), json=body).status_code == 200
+        unchanged = client.get(f"{endpoint[:-10]}", headers=headers(67)).json()
+        assert unchanged["stage"] == "saved"
+        assert unchanged["fit_score"] is None
+
+
+def test_profile_and_feedback_are_candidate_scoped_and_auditable():
+    with TestClient(app) as client:
+        assert client.get("/career-workspace/profile", headers=headers(41)).json()["full_name"] == ""
+        saved = client.put("/career-workspace/profile", headers=headers(41), json={
+            "full_name": "Alex Example", "target_roles": ["Engineer"],
+            "skills": ["Python"], "resume_markdown": "# Reviewed resume",
+        })
+        assert saved.status_code == 200, saved.text
+        assert client.get("/career-workspace/profile", headers=headers(41)).json()["skills"] == ["Python"]
+        assert client.get("/career-workspace/profile", headers=headers(42)).json()["full_name"] == ""
+        case = client.post("/career-workspace/applications", headers=headers(41), json={
+            "company": "Example", "role": "Engineer", "sources": ["career-ops"],
+        }).json()
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(41)
+        ).json()["company"] == "Example"
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(42)
+        ).status_code == 404
+        endpoint = f"/career-workspace/applications/{case['id']}/feedback"
+        assert client.post(endpoint, headers=headers(42), json={
+            "stage": "interview", "note": "Employer invited me",
+        }).status_code == 404
+        changed = client.post(endpoint, headers=headers(41), json={
+            "stage": "interview", "note": "Employer invited me",
+        })
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["application"]["stage"] == "interview"
+        events = client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(41)
+        ).json()["feedback"]
+        assert events[-1]["from_stage"] == "saved"
+        assert events[-1]["to_stage"] == "interview"
+        assert events[-1]["note"] == "Employer invited me"
+        drafted = client.post(
+            f"/career-workspace/applications/{case['id']}/artifacts",
+            headers=headers(41), json={
+                "kind": "followup", "source": "hanggent", "content_markdown": "Dear recruiter, ...",
+            },
+        )
+        assert drafted.status_code == 200, drafted.text
+
+
+def test_confirmed_contact_is_separate_from_draft_and_drives_reminder():
+    with TestClient(app) as client:
+        case = client.post("/career-workspace/applications", headers=headers(50), json={
+            "company": "Contact Co", "role": "Analyst", "stage": "applied",
+        }).json()
+        endpoint = f"/career-workspace/applications/{case['id']}/contacts"
+        payload = {
+            "channel": "email", "note": "Sent recruiter a follow-up email",
+            "contacted_at": "2026-10-15T10:00:00Z",
+            "next_followup_at": "2026-10-20T10:00:00Z", "confirmed_contact": True,
+        }
+        assert client.post(endpoint, headers=headers(51), json=payload).status_code == 404
+        assert client.post(endpoint, headers=headers(50), json={
+            **payload, "confirmed_contact": False,
+        }).status_code == 400
+        assert client.post(endpoint, headers=headers(50), json={
+            **payload, "next_followup_at": "2026-10-14T10:00:00Z",
+        }).status_code == 400
+        drafted = client.post(
+            f"/career-workspace/applications/{case['id']}/artifacts", headers=headers(50),
+            json={"kind": "followup", "source": "hanggent", "content_markdown": "Draft only"},
+        )
+        assert drafted.status_code == 200, drafted.text
+        assert client.get(f"{endpoint.removesuffix('/contacts')}/activity", headers=headers(50)).json()["contacts"] == []
+        response = client.post(endpoint, headers=headers(50), json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["source"] == "candidate_confirmed"
+        listed = client.get("/career-workspace/applications", headers=headers(50)).json()
+        assert listed[0]["last_contact_at"].startswith("2026-10-15")
+        assert listed[0]["next_followup_at"].startswith("2026-10-20")
+        detail = client.get(f"/career-workspace/applications/{case['id']}", headers=headers(50)).json()
+        assert detail["next_followup_at"] == listed[0]["next_followup_at"]
+        activity = client.get(f"/career-workspace/applications/{case['id']}/activity", headers=headers(50)).json()
+        assert len(activity["contacts"]) == 1
+        assert activity["contacts"][0]["note"] == payload["note"]
+        assert client.get(f"/career-workspace/applications/{case['id']}/activity", headers=headers(51)).status_code == 404
+
+
+def test_legacy_scores_are_unverified_after_schema_upgrade():
+    async def check():
+        old_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with old_engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "CREATE TABLE career_applications (id VARCHAR PRIMARY KEY, fit_score FLOAT)"
+                )
+                await connection.exec_driver_sql(
+                    "INSERT INTO career_applications (id, fit_score) VALUES ('legacy', 95)"
+                )
+                await ensure_career_score_kind(connection)
+                await ensure_career_score_kind(connection)
+                row = (await connection.exec_driver_sql(
+                    "SELECT fit_score, score_kind FROM career_applications WHERE id = 'legacy'"
+                )).one()
+                assert row == (95, "unverified")
+        finally:
+            await old_engine.dispose()
+    asyncio.run(check())
 
 
 def test_one_job_confirmation_and_bounded_auto_authorization():
@@ -150,8 +384,44 @@ def test_auto_campaign_is_site_scoped_bounded_and_revocable():
             json={"authorization_id": policy["id"], "idempotency_key": "other-site-999"},
             headers=headers(3),
         ).status_code == 403
+        endpoint = f"/career-workspace/applications/{allowed['id']}/submission-attempts"
+        assert client.post(endpoint, json={
+            "authorization_id": policy["id"], "idempotency_key": "preliminary-score-999",
+        }, headers=headers(3)).status_code == 403
+        imported = client.post("/career-workspace/applications", json={
+            "company": "North", "role": "Engineer", "fit_score": 99,
+            "score_kind": "career_ops_import",
+            "job_url": "https://www.linkedin.com/jobs/view/999", "sources": ["career-ops"],
+        }, headers=headers(3)).json()
+        assert imported["fit_score"] == 99
+        assert client.post(endpoint, json={
+            "authorization_id": policy["id"], "idempotency_key": "imported-score-999",
+        }, headers=headers(3)).status_code == 403
+        evaluated = client.post("/career-workspace/applications", json={
+            "company": "North", "role": "Engineer", "fit_score": 70,
+            "score_kind": "career_ops_evaluation",
+            "job_url": "https://www.linkedin.com/jobs/view/999", "sources": ["career-ops"],
+        }, headers=headers(3)).json()
+        assert evaluated["id"] == allowed["id"]
+        assert evaluated["fit_score"] == 70
+        preliminary_resync = client.post("/career-workspace/applications", json={
+            "company": "North", "role": "Engineer", "fit_score": 100,
+            "score_kind": "resume_overlap",
+            "job_url": "https://www.linkedin.com/jobs/view/999", "sources": ["career-compass"],
+        }, headers=headers(3)).json()
+        assert preliminary_resync["fit_score"] == 70
+        assert preliminary_resync["score_kind"] == "career_ops_evaluation"
+        assert client.post(endpoint, json={
+            "authorization_id": policy["id"], "idempotency_key": "low-evaluation-999",
+        }, headers=headers(3)).status_code == 403
+        evaluated = client.post("/career-workspace/applications", json={
+            "company": "North", "role": "Engineer", "fit_score": 95,
+            "score_kind": "career_ops_evaluation",
+            "job_url": "https://www.linkedin.com/jobs/view/999", "sources": ["career-ops"],
+        }, headers=headers(3)).json()
+        assert evaluated["fit_score"] == 95
         attempt = client.post(
-            f"/career-workspace/applications/{allowed['id']}/submission-attempts",
+            endpoint,
             json={"authorization_id": policy["id"], "idempotency_key": "allowed-site-999"},
             headers=headers(3),
         )

@@ -18,7 +18,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.career_auth import career_user
 from app.database import get_db
-from app.models import CareerApplication, CareerArtifact, SubmissionAuthorization, SubmissionAttempt
+from app.models import (
+    CareerApplication, CareerArtifact, CareerCandidateProfile, CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
+    SubmissionAuthorization, SubmissionAttempt,
+)
 
 
 router = APIRouter(tags=["career-workspace"])
@@ -68,12 +71,41 @@ class ApplicationIn(BaseModel):
     job_url: str | None = None
     stage: str = "saved"
     fit_score: float | None = Field(default=None, ge=0, le=100)
+    score_kind: str = Field(default="unverified", pattern="^(unverified|resume_overlap|career_ops_import|career_ops_evaluation)$")
     sources: list[str] = Field(default_factory=list, max_length=5)
     notes: list[str] = Field(default_factory=list, max_length=20)
 
 
+class PipelineIn(BaseModel):
+    job_url: str = Field(min_length=10, max_length=2000)
+    company: str = Field(default="", max_length=200)
+    role: str = Field(default="", max_length=200)
+
+
+class CandidateProfileIn(BaseModel):
+    full_name: str = Field(default="", max_length=200)
+    headline: str = Field(default="", max_length=300)
+    location: str = Field(default="", max_length=200)
+    target_roles: list[str] = Field(default_factory=list, max_length=20)
+    skills: list[str] = Field(default_factory=list, max_length=100)
+    resume_markdown: str = Field(default="", max_length=100000)
+
+
+class StageFeedbackIn(BaseModel):
+    stage: str
+    note: str = Field(min_length=3, max_length=2000)
+
+
+class ContactIn(BaseModel):
+    channel: str = Field(pattern="^(email|linkedin|phone|other)$")
+    note: str = Field(min_length=3, max_length=2000)
+    contacted_at: datetime
+    next_followup_at: datetime | None = None
+    confirmed_contact: bool
+
+
 class ArtifactIn(BaseModel):
-    kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|interview_prep)$")
+    kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|research|research_task_link|source_observation|liveness_check|interview_prep|followup|offer_prep)$")
     source: str = Field(pattern="^(career-compass|career-ops|ai-job-search|proficiently|hanggent)$")
     content_markdown: str = Field(min_length=1, max_length=100000)
 
@@ -111,19 +143,127 @@ class ResolveIn(BaseModel):
 
 def _application_out(
     item: CareerApplication, *, blocking_attempt: tuple[str, str] | None = None,
+    latest_contact: CareerContactEvent | None = None,
 ) -> dict:
     return {
         "id": item.id, "company": item.company, "role": item.role,
         "location": item.location, "job_url": item.job_url, "stage": item.stage,
-        "fit_score": item.fit_score, "sources": item.sources, "notes": item.notes,
+        "fit_score": item.fit_score, "score_kind": item.score_kind,
+        "sources": item.sources, "notes": item.notes,
+        "created_at": item.created_at, "updated_at": item.updated_at,
         "submission_blocked": blocking_attempt is not None,
         "blocking_attempt_id": blocking_attempt[0] if blocking_attempt else None,
         "blocking_attempt_status": blocking_attempt[1] if blocking_attempt else None,
+        "last_contact_at": latest_contact.contacted_at if latest_contact else None,
+        "next_followup_at": latest_contact.next_followup_at if latest_contact else None,
+    }
+
+
+def _pipeline_out(item: CareerPipelineEntry) -> dict:
+    return {
+        "id": item.id, "job_url": item.job_url, "company": item.company,
+        "role": item.role, "status": item.status,
+        "created_at": item.created_at, "updated_at": item.updated_at,
     }
 
 
 def _expiry(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _profile_out(profile: CareerCandidateProfile | None) -> dict:
+    if profile is None:
+        return CandidateProfileIn().model_dump()
+    return {
+        "full_name": profile.full_name, "headline": profile.headline,
+        "location": profile.location, "target_roles": profile.target_roles,
+        "skills": profile.skills, "resume_markdown": profile.resume_markdown,
+    }
+
+
+@router.get("/profile")
+async def get_candidate_profile(
+    user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    profile = await db.get(CareerCandidateProfile, user_id)
+    return _profile_out(profile)
+
+
+@router.put("/profile")
+async def save_candidate_profile(
+    body: CandidateProfileIn, user_id: str = Depends(career_user),
+    db: AsyncSession = Depends(get_db),
+):
+    profile = await db.get(CareerCandidateProfile, user_id)
+    if profile is None:
+        profile = CareerCandidateProfile(user_id=user_id)
+        db.add(profile)
+    for field, value in body.model_dump().items():
+        setattr(profile, field, value)
+    await db.commit()
+    return _profile_out(profile)
+
+
+@router.post("/applications/{application_id}/feedback")
+async def record_candidate_feedback(
+    application_id: str, body: StageFeedbackIn,
+    user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    if body.stage not in STAGES:
+        raise HTTPException(400, "Invalid stage")
+    if len(body.note.strip()) < 3:
+        raise HTTPException(400, "A meaningful feedback note is required")
+    application = (await db.execute(select(CareerApplication).where(
+        CareerApplication.id == application_id, CareerApplication.user_id == user_id,
+    ).with_for_update())).scalar_one_or_none()
+    if application is None:
+        raise HTTPException(404, "Application not found")
+    previous = application.stage
+    event = CareerStageEvent(
+        application_id=application_id, user_id=user_id, from_stage=previous,
+        to_stage=body.stage, note=body.note.strip(), source="candidate",
+    )
+    application.stage = body.stage
+    db.add(event)
+    await db.commit()
+    await db.refresh(application)
+    return {"application": _application_out(application), "event_id": event.id,
+            "external_submission": "candidate_reported" if body.stage == "applied" else "not_claimed"}
+
+
+@router.post("/applications/{application_id}/contacts")
+async def record_employer_contact(
+    application_id: str, body: ContactIn,
+    user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    application = (await db.execute(select(CareerApplication).where(
+        CareerApplication.id == application_id, CareerApplication.user_id == user_id,
+    ))).scalar_one_or_none()
+    if application is None:
+        raise HTTPException(404, "Application not found")
+    if application.stage in {"saved", "closed", "accepted"}:
+        raise HTTPException(409, "Employer contact requires an active application")
+    if not body.confirmed_contact or len(body.note.strip()) < 3:
+        raise HTTPException(400, "Confirm actual contact and include a meaningful note")
+    if body.contacted_at.tzinfo is None or (
+        body.next_followup_at is not None and body.next_followup_at.tzinfo is None
+    ):
+        raise HTTPException(400, "Contact and reminder times must include a timezone")
+    now = datetime.now(timezone.utc)
+    if body.contacted_at > now + timedelta(minutes=5):
+        raise HTTPException(400, "Contact cannot be in the future")
+    if body.next_followup_at is not None and body.next_followup_at <= body.contacted_at:
+        raise HTTPException(400, "Reminder must be after the contact")
+    event = CareerContactEvent(
+        application_id=application_id, user_id=user_id, channel=body.channel,
+        note=body.note.strip(), contacted_at=body.contacted_at,
+        next_followup_at=body.next_followup_at,
+    )
+    db.add(event)
+    await db.commit()
+    return {"id": event.id, "channel": event.channel, "note": event.note,
+            "contacted_at": event.contacted_at, "next_followup_at": event.next_followup_at,
+            "source": "candidate_confirmed"}
 
 
 @router.get("/submission-attempts/{attempt_id}")
@@ -269,6 +409,12 @@ async def application_activity(
     attempts = (await db.execute(select(SubmissionAttempt).where(
         SubmissionAttempt.application_id == application_id, SubmissionAttempt.user_id == user_id,
     ).order_by(SubmissionAttempt.created_at.desc()))).scalars().all()
+    feedback = (await db.execute(select(CareerStageEvent).where(
+        CareerStageEvent.application_id == application_id, CareerStageEvent.user_id == user_id,
+    ).order_by(CareerStageEvent.created_at.desc()))).scalars().all()
+    contacts = (await db.execute(select(CareerContactEvent).where(
+        CareerContactEvent.application_id == application_id, CareerContactEvent.user_id == user_id,
+    ).order_by(CareerContactEvent.contacted_at.desc(), CareerContactEvent.created_at.desc()))).scalars().all()
     return {
         "artifacts": [{"id": item.id, "kind": item.kind, "source": item.source,
                        "version": item.version, "content_markdown": item.content_markdown}
@@ -276,6 +422,13 @@ async def application_activity(
         "submission_attempts": [{"id": item.id, "site": item.site, "status": item.status,
                                  "receipt": item.receipt, "error": item.error}
                                 for item in attempts],
+        "feedback": [{"id": item.id, "from_stage": item.from_stage,
+                      "to_stage": item.to_stage, "note": item.note,
+                      "source": item.source, "created_at": item.created_at}
+                     for item in feedback],
+        "contacts": [{"id": item.id, "channel": item.channel, "note": item.note,
+                      "contacted_at": item.contacted_at, "next_followup_at": item.next_followup_at,
+                      "source": "candidate_confirmed"} for item in contacts],
     }
 
 
@@ -308,7 +461,69 @@ async def list_applications(user_id: str = Depends(career_user), db: AsyncSessio
     blocked = {}
     for application_id, attempt_id, status in blocked_rows:
         blocked.setdefault(application_id, (attempt_id, status))
-    return [_application_out(row, blocking_attempt=blocked.get(row.id)) for row in rows]
+    contact_rows = (await db.execute(select(CareerContactEvent).where(
+        CareerContactEvent.user_id == user_id,
+    ).order_by(CareerContactEvent.contacted_at.desc(), CareerContactEvent.created_at.desc()))).scalars().all()
+    latest_contacts = {}
+    for contact in contact_rows:
+        latest_contacts.setdefault(contact.application_id, contact)
+    return [_application_out(row, blocking_attempt=blocked.get(row.id),
+                             latest_contact=latest_contacts.get(row.id)) for row in rows]
+
+
+@router.get("/pipeline")
+async def list_pipeline(user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(select(CareerPipelineEntry).where(
+        CareerPipelineEntry.user_id == user_id,
+    ).order_by(CareerPipelineEntry.created_at.desc()))).scalars().all()
+    return [_pipeline_out(row) for row in rows]
+
+
+@router.post("/pipeline")
+async def queue_pipeline_url(
+    body: PipelineIn, user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    try:
+        url = canonical_url(body.job_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    url_key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    row = (await db.execute(select(CareerPipelineEntry).where(
+        CareerPipelineEntry.user_id == user_id, CareerPipelineEntry.url_key == url_key,
+    ))).scalar_one_or_none()
+    if row is None:
+        row = CareerPipelineEntry(
+            user_id=user_id, url_key=url_key, job_url=url,
+            company=body.company.strip(), role=body.role.strip(), status="pending",
+        )
+        db.add(row)
+    else:
+        row.company = body.company.strip() or row.company
+        row.role = body.role.strip() or row.role
+        # An evaluated URL must not return to the pending inbox on a re-save.
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(409, "Job URL was concurrently queued; retry") from exc
+    await db.refresh(row)
+    return _pipeline_out(row)
+
+
+@router.get("/applications/{application_id}")
+async def get_application(
+    application_id: str, user_id: str = Depends(career_user),
+    db: AsyncSession = Depends(get_db),
+):
+    row = (await db.execute(select(CareerApplication).where(
+        CareerApplication.id == application_id, CareerApplication.user_id == user_id,
+    ))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, "Application not found")
+    contact = (await db.execute(select(CareerContactEvent).where(
+        CareerContactEvent.application_id == application_id, CareerContactEvent.user_id == user_id,
+    ).order_by(CareerContactEvent.contacted_at.desc(), CareerContactEvent.created_at.desc()).limit(1))).scalar_one_or_none()
+    return _application_out(row, latest_contact=contact)
 
 
 @router.post("/applications")
@@ -317,6 +532,12 @@ async def upsert_application(
 ):
     if body.stage not in STAGES or not set(body.sources).issubset(SOURCE_NAMES):
         raise HTTPException(400, "Invalid stage or source")
+    if body.score_kind == "career_ops_evaluation" and (
+        "career-ops" not in body.sources or body.fit_score is None
+    ):
+        raise HTTPException(400, "A career-ops evaluation requires its source and score")
+    if body.score_kind == "career_ops_import" and "career-ops" not in body.sources:
+        raise HTTPException(400, "An imported score requires its career-ops source")
     try:
         url = canonical_url(body.job_url) if body.job_url else None
     except ValueError as exc:
@@ -331,7 +552,8 @@ async def upsert_application(
         row = CareerApplication(
             user_id=user_id, canonical_key=key, company=body.company.strip(), role=body.role.strip(),
             location=body.location, job_url=url, stage=body.stage, fit_score=body.fit_score,
-            sources=sorted(set(body.sources)), notes=list(dict.fromkeys(body.notes)),
+            score_kind=body.score_kind, sources=sorted(set(body.sources)),
+            notes=list(dict.fromkeys(body.notes)),
         )
         db.add(row)
     else:
@@ -341,8 +563,33 @@ async def upsert_application(
                     "interview": 5, "offer": 6, "accepted": 7, "closed": 8}
         if priority[body.stage] > priority[row.stage]:
             row.stage = body.stage
-        if body.fit_score is not None:
+        # A career-ops global evaluation supersedes a preliminary resume
+        # overlap score, including when the evaluation is less favorable or
+        # the imported tracker has no score. A later search-only sync must not
+        # silently restore that old score.
+        if body.score_kind == "career_ops_evaluation":
+            row.fit_score = body.fit_score
+            row.score_kind = body.score_kind
+        elif body.score_kind == "career_ops_import" and row.score_kind != "career_ops_evaluation":
+            row.fit_score = body.fit_score
+            row.score_kind = body.score_kind
+        elif body.fit_score is not None and row.score_kind not in {"career_ops_evaluation", "career_ops_import"}:
             row.fit_score = max(row.fit_score or 0, body.fit_score)
+            row.score_kind = body.score_kind
+    if url:
+        url_key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        inbox = (await db.execute(select(CareerPipelineEntry).where(
+            CareerPipelineEntry.user_id == user_id, CareerPipelineEntry.url_key == url_key,
+        ))).scalar_one_or_none()
+        processed = row.stage != "saved" or row.score_kind == "career_ops_evaluation"
+        if inbox is None:
+            db.add(CareerPipelineEntry(
+                user_id=user_id, url_key=url_key, job_url=url,
+                company=row.company, role=row.role,
+                status="processed" if processed else "pending",
+            ))
+        elif processed:
+            inbox.status = "processed"
     try:
         await db.commit()
     except IntegrityError as exc:
@@ -456,7 +703,10 @@ async def queue_submission(
         raise HTTPException(403, "Job site is outside the authorization")
     if policy.mode == "confirm_each" and policy.application_id != application_id:
         raise HTTPException(403, "Authorization is for another application")
-    if policy.mode == "auto" and (application.fit_score is None or application.fit_score < policy.min_fit_score):
+    if policy.mode == "auto" and (
+        application.score_kind != "career_ops_evaluation"
+        or application.fit_score is None or application.fit_score < policy.min_fit_score
+    ):
         raise HTTPException(403, "Job does not meet the authorized fit threshold")
     blocking_attempt = (await db.execute(select(SubmissionAttempt.id).where(
         SubmissionAttempt.user_id == user_id,

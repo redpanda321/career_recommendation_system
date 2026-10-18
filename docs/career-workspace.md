@@ -1,10 +1,18 @@
 # Career Recommendations integration
 
-CareerCompassAI owns the candidate-scoped application, artifact, authorization, and
-submission-attempt records. Hanggent authenticates the candidate and exchanges its
+CareerCompassAI's database is the system of record for candidate profiles,
+job/application rows, pipeline URLs, feedback, generated materials, authorizations,
+and submission attempts. Hanggent authenticates the candidate and exchanges its
 session for a 60-second, audience-limited `career_bridge` token; the API gateway and
 job service independently validate that token. The gateway only proxies explicitly
 registered career routes to the private job service.
+
+Career-ops remains an adapter and interchange format, not a second live database. The
+`GET/POST /career-workspace/pipeline` inbox is stored in `career_pipeline_entries`
+with per-user URL deduplication; an evaluated or applied application marks the
+matching URL processed. Existing career-ops Markdown files are read only during
+an explicit user-initiated import. They never overwrite database records during
+ordinary reads, and no shared server-side career-ops CLI writes user files.
 
 The current adapters preserve their origins:
 
@@ -21,6 +29,24 @@ Recommendation runs also upsert discovered roles and save generated package vers
 Rows are deduplicated by normalized public job URL, or by company/role/location when
 no URL is available. A URL-bearing record and a URL-less record are not assumed to
 be identical.
+
+Candidate-reviewed job research is stored as versioned `research` artifacts on
+the canonical application row. Hanggent may hand a role to Eigent as an unsent
+research draft, but the candidate must review sources and explicitly save the
+result to the selected application. Saving research neither changes the stage
+or score nor queues a submission. Drafting adapters may use it as unverified,
+candidate-supplied context; automatic Eigent outcome sync is not implemented.
+
+Hanggent may additionally save a `research_task_link` artifact containing only
+opaque Eigent project/task IDs after verifying a saved task belongs to the
+signed-in owner. The canonical store versions this metadata with the same
+per-application isolation as other artifacts. It is not a task transcript,
+verified company research, or permission to submit an application. Any future
+task-outcome reader must recheck ownership instead of trusting stored IDs.
+For saved legacy tasks, Hanggent can preview a completed task summary only
+after this ownership check and a matching link. The summary is not saved as
+research until the candidate reviews its sources and confirms a separate
+artifact write.
 
 Submission modes share one durable policy model:
 
