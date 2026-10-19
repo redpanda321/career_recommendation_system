@@ -24,7 +24,7 @@ from app.database import get_db
 from app.evaluation_sources import parse_source_snapshot, report_source_id, verify_requirement_quotes
 from app.models import (
     CareerApplication, CareerArtifact, CareerCandidateProfile, CareerComparisonSnapshot,
-    CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
+CareerContactEvent, CareerPipelineEntry, CareerReplyEvent, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
 )
 
@@ -118,6 +118,13 @@ class ContactIn(BaseModel):
     confirmed_contact: bool
 
 
+class ReplyIn(BaseModel):
+    channel: str = Field(pattern="^(email|linkedin|phone|other)$")
+    note: str = Field(min_length=3, max_length=2000)
+    received_at: datetime
+    confirmed_reply: bool
+
+
 class ArtifactIn(BaseModel):
     kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|evaluation_sources|research|research_task_link|source_observation|liveness_check|interview_prep|followup|outreach|offer_prep)$")
     source: str = Field(pattern="^(career-compass|career-ops|ai-job-search|proficiently|hanggent)$")
@@ -158,7 +165,12 @@ class ResolveIn(BaseModel):
 def _application_out(
     item: CareerApplication, *, blocking_attempt: tuple[str, str] | None = None,
     latest_contact: CareerContactEvent | None = None,
+    latest_reply: CareerReplyEvent | None = None,
 ) -> dict:
+    reply_after_contact = bool(
+        latest_contact and latest_reply
+        and _expiry(latest_reply.received_at) >= _expiry(latest_contact.contacted_at)
+    )
     return {
         "id": item.id, "company": item.company, "role": item.role,
         "location": item.location, "job_url": item.job_url, "stage": item.stage,
@@ -171,7 +183,8 @@ def _application_out(
         "blocking_attempt_id": blocking_attempt[0] if blocking_attempt else None,
         "blocking_attempt_status": blocking_attempt[1] if blocking_attempt else None,
         "last_contact_at": latest_contact.contacted_at if latest_contact else None,
-        "next_followup_at": latest_contact.next_followup_at if latest_contact else None,
+    "last_reply_at": latest_reply.received_at if latest_reply else None,
+    "next_followup_at": latest_contact.next_followup_at if latest_contact and not reply_after_contact else None,
     }
 
 
@@ -287,6 +300,33 @@ async def record_employer_contact(
     return {"id": event.id, "channel": event.channel, "note": event.note,
             "contacted_at": event.contacted_at, "next_followup_at": event.next_followup_at,
             "source": "candidate_confirmed"}
+
+
+@router.post("/applications/{application_id}/replies")
+async def record_employer_reply(
+    application_id: str, body: ReplyIn,
+    user_id: str = Depends(career_user), db: AsyncSession = Depends(get_db),
+):
+    application = (await db.execute(select(CareerApplication).where(
+        CareerApplication.id == application_id, CareerApplication.user_id == user_id,
+    ))).scalar_one_or_none()
+    if application is None:
+        raise HTTPException(404, "Application not found")
+    if not body.confirmed_reply or len(body.note.strip()) < 3:
+        raise HTTPException(400, "Confirm the actual reply and include a meaningful note")
+    if body.received_at.tzinfo is None:
+        raise HTTPException(400, "Reply time must include a timezone")
+    if body.received_at > datetime.now(timezone.utc) + timedelta(minutes=5):
+        raise HTTPException(400, "Reply cannot be in the future")
+    event = CareerReplyEvent(
+        application_id=application_id, user_id=user_id, channel=body.channel,
+        note=body.note.strip(), received_at=body.received_at,
+    )
+    db.add(event)
+    await db.commit()
+    return {"id": event.id, "channel": event.channel, "note": event.note,
+            "received_at": event.received_at, "source": "candidate_reported",
+            "external_verification": "none"}
 
 
 @router.get("/submission-attempts/{attempt_id}")
@@ -438,6 +478,9 @@ async def application_activity(
     contacts = (await db.execute(select(CareerContactEvent).where(
         CareerContactEvent.application_id == application_id, CareerContactEvent.user_id == user_id,
     ).order_by(CareerContactEvent.contacted_at.desc(), CareerContactEvent.created_at.desc()))).scalars().all()
+    replies = (await db.execute(select(CareerReplyEvent).where(
+        CareerReplyEvent.application_id == application_id, CareerReplyEvent.user_id == user_id,
+    ).order_by(CareerReplyEvent.received_at.desc(), CareerReplyEvent.created_at.desc()))).scalars().all()
     return {
         "artifacts": [{"id": item.id, "kind": item.kind, "source": item.source,
                        "version": item.version, "content_markdown": item.content_markdown}
@@ -452,6 +495,9 @@ async def application_activity(
         "contacts": [{"id": item.id, "channel": item.channel, "note": item.note,
                       "contacted_at": item.contacted_at, "next_followup_at": item.next_followup_at,
                       "source": "candidate_confirmed"} for item in contacts],
+    "replies": [{"id": item.id, "channel": item.channel, "note": item.note,
+    "received_at": item.received_at, "source": "candidate_reported",
+    "external_verification": "none"} for item in replies],
     }
 
 
@@ -490,8 +536,15 @@ async def list_applications(user_id: str = Depends(career_user), db: AsyncSessio
     latest_contacts = {}
     for contact in contact_rows:
         latest_contacts.setdefault(contact.application_id, contact)
+    reply_rows = (await db.execute(select(CareerReplyEvent).where(
+        CareerReplyEvent.user_id == user_id,
+    ).order_by(CareerReplyEvent.received_at.desc(), CareerReplyEvent.created_at.desc()))).scalars().all()
+    latest_replies = {}
+    for reply in reply_rows:
+        latest_replies.setdefault(reply.application_id, reply)
     return [_application_out(row, blocking_attempt=blocked.get(row.id),
-                             latest_contact=latest_contacts.get(row.id)) for row in rows]
+                             latest_contact=latest_contacts.get(row.id),
+                             latest_reply=latest_replies.get(row.id)) for row in rows]
 
 
 @router.get("/pipeline")
@@ -609,7 +662,10 @@ async def get_application(
     contact = (await db.execute(select(CareerContactEvent).where(
         CareerContactEvent.application_id == application_id, CareerContactEvent.user_id == user_id,
     ).order_by(CareerContactEvent.contacted_at.desc(), CareerContactEvent.created_at.desc()).limit(1))).scalar_one_or_none()
-    return _application_out(row, latest_contact=contact)
+    reply = (await db.execute(select(CareerReplyEvent).where(
+        CareerReplyEvent.application_id == application_id, CareerReplyEvent.user_id == user_id,
+    ).order_by(CareerReplyEvent.received_at.desc(), CareerReplyEvent.created_at.desc()).limit(1))).scalar_one_or_none()
+    return _application_out(row, latest_contact=contact, latest_reply=reply)
 
 
 @router.post("/applications")

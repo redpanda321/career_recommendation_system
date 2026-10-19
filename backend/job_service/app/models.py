@@ -142,6 +142,22 @@ class CareerContactEvent(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class CareerReplyEvent(Base):
+    """Candidate-reported inbound employer reply, not mailbox-verified evidence."""
+
+    __tablename__ = "career_reply_events"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    application_id = Column(
+        String(36), ForeignKey("career_applications.id"), nullable=False, index=True
+    )
+    user_id = Column(String(80), nullable=False, index=True)
+    channel = Column(String(20), nullable=False)
+    note = Column(Text, nullable=False)
+    received_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class CareerArtifact(Base):
     """Immutable, versioned output from an adapter or a candidate edit."""
 

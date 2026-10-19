@@ -18,7 +18,7 @@ from app.database import AsyncSessionLocal, Base, engine
 from app.database import ensure_career_score_kind
 from app.models import (
     CareerApplication, CareerArtifact, CareerCandidateProfile, CareerComparisonSnapshot,
-    CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
+    CareerContactEvent, CareerPipelineEntry, CareerReplyEvent, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
 )
 from app.routers.career import router
@@ -47,6 +47,7 @@ def setup_module():
             await connection.run_sync(Base.metadata.create_all, tables=[
                 CareerApplication.__table__, CareerArtifact.__table__,
                 CareerCandidateProfile.__table__, CareerStageEvent.__table__, CareerContactEvent.__table__,
+                CareerReplyEvent.__table__,
                 CareerPipelineEntry.__table__, CareerComparisonSnapshot.__table__,
                 SubmissionAuthorization.__table__, SubmissionAttempt.__table__,
             ])
@@ -563,6 +564,63 @@ def test_confirmed_contact_is_separate_from_draft_and_drives_reminder():
         assert len(activity["contacts"]) == 1
         assert activity["contacts"][0]["note"] == payload["note"]
         assert client.get(f"/career-workspace/applications/{case['id']}/activity", headers=headers(51)).status_code == 404
+
+
+def test_candidate_reported_reply_is_owner_scoped_and_does_not_advance_stage():
+    with TestClient(app) as client:
+        case = client.post("/career-workspace/applications", headers=headers(54), json={
+            "company": "Reply Co", "role": "Analyst", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{case['id']}/replies"
+        payload = {
+            "channel": "email", "note": "Recruiter asked for availability",
+            "received_at": "2026-10-17T10:00:00Z", "confirmed_reply": True,
+        }
+        contact_endpoint = f"/career-workspace/applications/{case['id']}/contacts"
+        assert client.post(contact_endpoint, headers=headers(54), json={
+            "channel": "email", "note": "Sent first contact",
+            "contacted_at": "2026-10-16T10:00:00Z",
+            "next_followup_at": "2026-10-20T10:00:00Z", "confirmed_contact": True,
+        }).status_code == 200
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(54),
+        ).json()["next_followup_at"].startswith("2026-10-20")
+        assert client.post(endpoint, headers=headers(55), json=payload).status_code == 404
+        assert client.post(endpoint, headers=headers(54), json={
+            **payload, "confirmed_reply": False,
+        }).status_code == 400
+        assert client.post(endpoint, headers=headers(54), json={
+            **payload, "received_at": "2030-10-17T10:00:00Z",
+        }).status_code == 400
+        response = client.post(endpoint, headers=headers(54), json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["source"] == "candidate_reported"
+        assert response.json()["external_verification"] == "none"
+        activity = client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(54),
+        ).json()
+        assert len(activity["replies"]) == 1
+        assert activity["replies"][0]["note"] == payload["note"]
+        assert len(activity["contacts"]) == 1
+        assert activity["submission_attempts"] == []
+        detail = client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(54),
+        ).json()
+        assert detail["stage"] == "saved"
+        assert detail["last_reply_at"].startswith("2026-10-17")
+        assert detail["next_followup_at"] is None
+        assert client.get("/career-workspace/applications", headers=headers(54)).json()[0]["next_followup_at"] is None
+        assert client.post(contact_endpoint, headers=headers(54), json={
+            "channel": "email", "note": "Answered the availability question",
+            "contacted_at": "2026-10-17T12:00:00Z",
+            "next_followup_at": "2026-10-21T10:00:00Z", "confirmed_contact": True,
+        }).status_code == 200
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(54),
+        ).json()["next_followup_at"].startswith("2026-10-21")
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(55),
+        ).status_code == 404
 
 
 def test_legacy_scores_are_unverified_after_schema_upgrade():
