@@ -128,6 +128,7 @@ class ReplyIn(BaseModel):
     note: str = Field(min_length=3, max_length=2000)
     received_at: datetime
     confirmed_reply: bool
+    idempotency_key: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class ArtifactIn(BaseModel):
@@ -328,12 +329,40 @@ async def record_employer_reply(
         raise HTTPException(400, "Reply time must include a timezone")
     if body.received_at > datetime.now(timezone.utc) + timedelta(minutes=5):
         raise HTTPException(400, "Reply cannot be in the future")
+    if body.idempotency_key:
+        prior = (await db.execute(select(CareerReplyEvent).where(
+            CareerReplyEvent.user_id == user_id,
+            CareerReplyEvent.idempotency_key == body.idempotency_key,
+        ))).scalar_one_or_none()
+        if prior is not None:
+            if prior.application_id != application_id:
+                raise HTTPException(409, "This mailbox candidate was already recorded for another application")
+            return _reply_out(prior)
     event = CareerReplyEvent(
         application_id=application_id, user_id=user_id, channel=body.channel,
         note=body.note.strip(), received_at=body.received_at,
+        idempotency_key=body.idempotency_key,
     )
     db.add(event)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        if not body.idempotency_key:
+            raise
+        prior = (await db.execute(select(CareerReplyEvent).where(
+            CareerReplyEvent.user_id == user_id,
+            CareerReplyEvent.idempotency_key == body.idempotency_key,
+        ))).scalar_one_or_none()
+        if prior is None:
+            raise
+        if prior.application_id != application_id:
+            raise HTTPException(409, "This mailbox candidate was already recorded for another application")
+        return _reply_out(prior)
+    return _reply_out(event)
+
+
+def _reply_out(event: CareerReplyEvent) -> dict:
     return {"id": event.id, "channel": event.channel, "note": event.note,
             "received_at": event.received_at, "source": "candidate_reported",
             "external_verification": "none"}

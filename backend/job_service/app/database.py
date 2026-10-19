@@ -24,6 +24,7 @@ async def create_db_and_tables():
         await ensure_career_evaluation_binding(conn)
         await ensure_career_evaluation_source_binding(conn)
         await ensure_career_outcome_kind(conn)
+        await ensure_career_reply_idempotency(conn)
 
 
 async def ensure_submission_worker_columns(conn):
@@ -95,6 +96,23 @@ async def ensure_career_outcome_kind(conn):
             await conn.exec_driver_sql(
                 f"ALTER TABLE {table} ADD COLUMN {optional}outcome_kind VARCHAR(32)"
             )
+
+
+async def ensure_career_reply_idempotency(conn):
+    """Allow retrying a confirmed inbox candidate without duplicating a reply."""
+    columns = await conn.run_sync(lambda sync_conn: {
+        column["name"] for column in inspect(sync_conn).get_columns("career_reply_events")
+    })
+    if "idempotency_key" not in columns:
+        optional = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
+        await conn.exec_driver_sql(
+            "ALTER TABLE career_reply_events ADD COLUMN "
+            f"{optional}idempotency_key VARCHAR(64)"
+        )
+    await conn.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_career_reply_user_idempotency "
+        "ON career_reply_events (user_id, idempotency_key)"
+    )
 
 # Dependency for FastAPI routes
 async def get_db():

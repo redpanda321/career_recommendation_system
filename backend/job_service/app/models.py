@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     JSON,
     Text,
     UniqueConstraint,
@@ -148,6 +149,7 @@ class CareerReplyEvent(Base):
     """Candidate-reported inbound employer reply, not mailbox-verified evidence."""
 
     __tablename__ = "career_reply_events"
+    __table_args__ = (Index("uq_career_reply_user_idempotency", "user_id", "idempotency_key", unique=True),)
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     application_id = Column(
@@ -157,6 +159,7 @@ class CareerReplyEvent(Base):
     channel = Column(String(20), nullable=False)
     note = Column(Text, nullable=False)
     received_at = Column(DateTime(timezone=True), nullable=False)
+    idempotency_key = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 

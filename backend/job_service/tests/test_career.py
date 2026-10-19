@@ -15,7 +15,7 @@ from jose import jwt
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.database import AsyncSessionLocal, Base, engine
-from app.database import ensure_career_outcome_kind, ensure_career_score_kind
+from app.database import ensure_career_outcome_kind, ensure_career_reply_idempotency, ensure_career_score_kind
 from app.models import (
     CareerApplication, CareerArtifact, CareerCandidateProfile, CareerComparisonSnapshot,
     CareerContactEvent, CareerPipelineEntry, CareerReplyEvent, CareerStageEvent,
@@ -656,6 +656,54 @@ def test_candidate_reported_reply_is_owner_scoped_and_does_not_advance_stage():
         assert client.get(
             f"/career-workspace/applications/{case['id']}/activity", headers=headers(55),
         ).status_code == 404
+
+
+def test_gmail_candidate_reply_retries_are_idempotent_and_cannot_move_between_roles():
+    with TestClient(app) as client:
+        first = client.post("/career-workspace/applications", headers=headers(71), json={
+            "company": "One", "role": "Analyst", "stage": "applied",
+        }).json()
+        second = client.post("/career-workspace/applications", headers=headers(71), json={
+            "company": "Two", "role": "Engineer", "stage": "applied",
+        }).json()
+        payload = {"channel": "email", "note": "Recruiter requested an interview",
+                   "received_at": "2026-10-17T10:00:00Z", "confirmed_reply": True,
+                   "idempotency_key": "a" * 64}
+        endpoint = f"/career-workspace/applications/{first['id']}/replies"
+        original = client.post(endpoint, headers=headers(71), json=payload)
+        retry = client.post(endpoint, headers=headers(71), json=payload)
+        assert original.status_code == retry.status_code == 200
+        assert original.json()["id"] == retry.json()["id"]
+        assert len(client.get(f"/career-workspace/applications/{first['id']}/activity", headers=headers(71)).json()["replies"]) == 1
+        moved = client.post(f"/career-workspace/applications/{second['id']}/replies", headers=headers(71), json=payload)
+        assert moved.status_code == 409
+        assert client.post(endpoint, headers=headers(72), json=payload).status_code == 404
+
+
+def test_legacy_reply_table_gains_idempotency_key_and_unique_index():
+    async def check():
+        old_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with old_engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "CREATE TABLE career_reply_events (id VARCHAR PRIMARY KEY, user_id VARCHAR NOT NULL)"
+                )
+                await ensure_career_reply_idempotency(connection)
+                await ensure_career_reply_idempotency(connection)
+                await connection.exec_driver_sql(
+                    "INSERT INTO career_reply_events (id, user_id, idempotency_key) VALUES ('one', '7', 'key')"
+                )
+                try:
+                    await connection.exec_driver_sql(
+                        "INSERT INTO career_reply_events (id, user_id, idempotency_key) VALUES ('two', '7', 'key')"
+                    )
+                except Exception:
+                    pass
+                else:
+                    raise AssertionError("The upgrade must enforce user-scoped reply idempotency")
+        finally:
+            await old_engine.dispose()
+    asyncio.run(check())
 
 
 def test_legacy_scores_are_unverified_after_schema_upgrade():
