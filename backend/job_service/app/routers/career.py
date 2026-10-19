@@ -119,7 +119,7 @@ class ContactIn(BaseModel):
 
 
 class ArtifactIn(BaseModel):
-    kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|evaluation_sources|research|research_task_link|source_observation|liveness_check|interview_prep|followup|offer_prep)$")
+    kind: str = Field(pattern="^(resume|cover_letter|application_package|evaluation|evaluation_sources|research|research_task_link|source_observation|liveness_check|interview_prep|followup|outreach|offer_prep)$")
     source: str = Field(pattern="^(career-compass|career-ops|ai-job-search|proficiently|hanggent)$")
     content_markdown: str = Field(min_length=1, max_length=100000)
 
@@ -264,7 +264,7 @@ async def record_employer_contact(
     ))).scalar_one_or_none()
     if application is None:
         raise HTTPException(404, "Application not found")
-    if application.stage in {"saved", "closed", "accepted"}:
+    if application.stage in {"closed", "accepted"}:
         raise HTTPException(409, "Employer contact requires an active application")
     if not body.confirmed_contact or len(body.note.strip()) < 3:
         raise HTTPException(400, "Confirm actual contact and include a meaningful note")

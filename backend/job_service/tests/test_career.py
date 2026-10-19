@@ -483,6 +483,50 @@ def test_profile_and_feedback_are_candidate_scoped_and_auditable():
         assert drafted.status_code == 200, drafted.text
 
 
+def test_outreach_draft_is_versioned_and_does_not_record_employer_contact():
+    with TestClient(app) as client:
+        case = client.post("/career-workspace/applications", headers=headers(52), json={
+            "company": "Outreach Co", "role": "Analyst", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{case['id']}/artifacts"
+        for version in (1, 2):
+            response = client.post(endpoint, headers=headers(52), json={
+                "kind": "outreach", "source": "hanggent",
+                "content_markdown": f"Candidate-review draft {version}; not sent",
+            })
+            assert response.status_code == 200, response.text
+            assert response.json()["version"] == version
+        activity = client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(52),
+        ).json()
+        assert [item["kind"] for item in activity["artifacts"]] == ["outreach", "outreach"]
+        assert activity["contacts"] == []
+        assert activity["submission_attempts"] == []
+        assert client.post(
+            f"/career-workspace/applications/{case['id']}/contacts", headers=headers(52), json={
+                "channel": "email", "note": "Sent the reviewed first-contact message",
+                "contacted_at": "2026-10-17T10:00:00Z", "confirmed_contact": False,
+            },
+        ).status_code == 400
+        contact = client.post(
+            f"/career-workspace/applications/{case['id']}/contacts", headers=headers(52), json={
+                "channel": "email", "note": "Sent the reviewed first-contact message",
+                "contacted_at": "2026-10-17T10:00:00Z", "confirmed_contact": True,
+                "next_followup_at": "2026-10-20T10:00:00Z",
+            },
+        )
+        assert contact.status_code == 200, contact.text
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(52),
+        ).json()["contacts"][0]["note"] == "Sent the reviewed first-contact message"
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(52),
+        ).json()["stage"] == "saved"
+        assert client.post(endpoint, headers=headers(53), json={
+            "kind": "outreach", "source": "hanggent", "content_markdown": "Not mine",
+        }).status_code == 404
+
+
 def test_confirmed_contact_is_separate_from_draft_and_drives_reminder():
     with TestClient(app) as client:
         case = client.post("/career-workspace/applications", headers=headers(50), json={
