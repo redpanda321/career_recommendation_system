@@ -16,6 +16,7 @@ class CareerWorkspacePreviewTests(unittest.TestCase):
         self.assertIn(("/comparisons", "GET"), routes)
         self.assertIn(("/comparisons", "POST"), routes)
         self.assertIn(("/applications/{application_id}/evaluation-score", "POST"), routes)
+        self.assertIn(("/applications/{application_id}/replies", "POST"), routes)
 
     def test_merges_same_role_and_uses_the_furthest_stage(self):
         preview = build_workspace_preview(WorkspaceImportRequest(

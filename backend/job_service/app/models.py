@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     JSON,
     Text,
     UniqueConstraint,
@@ -47,6 +48,7 @@ class CareerApplication(Base):
     location = Column(String(200))
     job_url = Column(Text)
     stage = Column(String(32), nullable=False, default="saved")
+    outcome_kind = Column(String(32))
     fit_score = Column(Float)
     score_kind = Column(String(32), nullable=False, default="unverified")
     evaluation_artifact_id = Column(String(36))
@@ -120,6 +122,7 @@ class CareerStageEvent(Base):
     user_id = Column(String(80), nullable=False, index=True)
     from_stage = Column(String(32), nullable=False)
     to_stage = Column(String(32), nullable=False)
+    outcome_kind = Column(String(32))
     note = Column(Text, nullable=False)
     source = Column(String(32), nullable=False, default="candidate")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -139,6 +142,24 @@ class CareerContactEvent(Base):
     note = Column(Text, nullable=False)
     contacted_at = Column(DateTime(timezone=True), nullable=False)
     next_followup_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CareerReplyEvent(Base):
+    """Candidate-reported inbound employer reply, not mailbox-verified evidence."""
+
+    __tablename__ = "career_reply_events"
+    __table_args__ = (Index("uq_career_reply_user_idempotency", "user_id", "idempotency_key", unique=True),)
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    application_id = Column(
+        String(36), ForeignKey("career_applications.id"), nullable=False, index=True
+    )
+    user_id = Column(String(80), nullable=False, index=True)
+    channel = Column(String(20), nullable=False)
+    note = Column(Text, nullable=False)
+    received_at = Column(DateTime(timezone=True), nullable=False)
+    idempotency_key = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 

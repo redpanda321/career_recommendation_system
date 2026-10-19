@@ -15,10 +15,10 @@ from jose import jwt
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.database import AsyncSessionLocal, Base, engine
-from app.database import ensure_career_score_kind
+from app.database import ensure_career_outcome_kind, ensure_career_reply_idempotency, ensure_career_score_kind
 from app.models import (
     CareerApplication, CareerArtifact, CareerCandidateProfile, CareerComparisonSnapshot,
-    CareerContactEvent, CareerPipelineEntry, CareerStageEvent,
+    CareerContactEvent, CareerPipelineEntry, CareerReplyEvent, CareerStageEvent,
     SubmissionAuthorization, SubmissionAttempt,
 )
 from app.routers.career import router
@@ -47,6 +47,7 @@ def setup_module():
             await connection.run_sync(Base.metadata.create_all, tables=[
                 CareerApplication.__table__, CareerArtifact.__table__,
                 CareerCandidateProfile.__table__, CareerStageEvent.__table__, CareerContactEvent.__table__,
+                CareerReplyEvent.__table__,
                 CareerPipelineEntry.__table__, CareerComparisonSnapshot.__table__,
                 SubmissionAuthorization.__table__, SubmissionAttempt.__table__,
             ])
@@ -483,6 +484,85 @@ def test_profile_and_feedback_are_candidate_scoped_and_auditable():
         assert drafted.status_code == 200, drafted.text
 
 
+def test_terminal_outcomes_are_candidate_labelled_and_reversible():
+    with TestClient(app) as client:
+        case = client.post("/career-workspace/applications", headers=headers(56), json={
+            "company": "Outcome Co", "role": "Engineer", "stage": "applied",
+        }).json()
+        endpoint = f"/career-workspace/applications/{case['id']}/feedback"
+        assert client.post(endpoint, headers=headers(57), json={
+            "stage": "closed", "outcome_kind": "rejected", "note": "Employer sent a rejection",
+        }).status_code == 404
+        assert client.post(endpoint, headers=headers(56), json={
+            "stage": "screening", "outcome_kind": "rejected", "note": "Wrong stage",
+        }).status_code == 400
+        assert client.post(endpoint, headers=headers(56), json={
+            "stage": "accepted", "outcome_kind": "rejected", "note": "Wrong reason",
+        }).status_code == 400
+        changed = client.post(endpoint, headers=headers(56), json={
+            "stage": "closed", "outcome_kind": "rejected", "note": "Employer sent a rejection",
+        })
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["application"]["outcome_kind"] == "rejected"
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(56),
+        ).json()["feedback"][0]["outcome_kind"] == "rejected"
+        reopened = client.post(endpoint, headers=headers(56), json={
+            "stage": "interview", "note": "Corrected an incorrect closure",
+        })
+        assert reopened.status_code == 200, reopened.text
+        assert reopened.json()["application"]["outcome_kind"] is None
+        accepted = client.post(endpoint, headers=headers(56), json={
+            "stage": "accepted", "outcome_kind": "accepted", "note": "I accepted the offer",
+        })
+        assert accepted.status_code == 200, accepted.text
+        assert client.get("/career-workspace/applications", headers=headers(56)).json()[0]["outcome_kind"] == "accepted"
+
+
+def test_outreach_draft_is_versioned_and_does_not_record_employer_contact():
+    with TestClient(app) as client:
+        case = client.post("/career-workspace/applications", headers=headers(52), json={
+            "company": "Outreach Co", "role": "Analyst", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{case['id']}/artifacts"
+        for version in (1, 2):
+            response = client.post(endpoint, headers=headers(52), json={
+                "kind": "outreach", "source": "hanggent",
+                "content_markdown": f"Candidate-review draft {version}; not sent",
+            })
+            assert response.status_code == 200, response.text
+            assert response.json()["version"] == version
+        activity = client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(52),
+        ).json()
+        assert [item["kind"] for item in activity["artifacts"]] == ["outreach", "outreach"]
+        assert activity["contacts"] == []
+        assert activity["submission_attempts"] == []
+        assert client.post(
+            f"/career-workspace/applications/{case['id']}/contacts", headers=headers(52), json={
+                "channel": "email", "note": "Sent the reviewed first-contact message",
+                "contacted_at": "2026-10-17T10:00:00Z", "confirmed_contact": False,
+            },
+        ).status_code == 400
+        contact = client.post(
+            f"/career-workspace/applications/{case['id']}/contacts", headers=headers(52), json={
+                "channel": "email", "note": "Sent the reviewed first-contact message",
+                "contacted_at": "2026-10-17T10:00:00Z", "confirmed_contact": True,
+                "next_followup_at": "2026-10-20T10:00:00Z",
+            },
+        )
+        assert contact.status_code == 200, contact.text
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(52),
+        ).json()["contacts"][0]["note"] == "Sent the reviewed first-contact message"
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(52),
+        ).json()["stage"] == "saved"
+        assert client.post(endpoint, headers=headers(53), json={
+            "kind": "outreach", "source": "hanggent", "content_markdown": "Not mine",
+        }).status_code == 404
+
+
 def test_confirmed_contact_is_separate_from_draft_and_drives_reminder():
     with TestClient(app) as client:
         case = client.post("/career-workspace/applications", headers=headers(50), json={
@@ -521,6 +601,111 @@ def test_confirmed_contact_is_separate_from_draft_and_drives_reminder():
         assert client.get(f"/career-workspace/applications/{case['id']}/activity", headers=headers(51)).status_code == 404
 
 
+def test_candidate_reported_reply_is_owner_scoped_and_does_not_advance_stage():
+    with TestClient(app) as client:
+        case = client.post("/career-workspace/applications", headers=headers(54), json={
+            "company": "Reply Co", "role": "Analyst", "stage": "saved",
+        }).json()
+        endpoint = f"/career-workspace/applications/{case['id']}/replies"
+        payload = {
+            "channel": "email", "note": "Recruiter asked for availability",
+            "received_at": "2026-10-17T10:00:00Z", "confirmed_reply": True,
+        }
+        contact_endpoint = f"/career-workspace/applications/{case['id']}/contacts"
+        assert client.post(contact_endpoint, headers=headers(54), json={
+            "channel": "email", "note": "Sent first contact",
+            "contacted_at": "2026-10-16T10:00:00Z",
+            "next_followup_at": "2026-10-20T10:00:00Z", "confirmed_contact": True,
+        }).status_code == 200
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(54),
+        ).json()["next_followup_at"].startswith("2026-10-20")
+        assert client.post(endpoint, headers=headers(55), json=payload).status_code == 404
+        assert client.post(endpoint, headers=headers(54), json={
+            **payload, "confirmed_reply": False,
+        }).status_code == 400
+        assert client.post(endpoint, headers=headers(54), json={
+            **payload, "received_at": "2030-10-17T10:00:00Z",
+        }).status_code == 400
+        response = client.post(endpoint, headers=headers(54), json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["source"] == "candidate_reported"
+        assert response.json()["external_verification"] == "none"
+        activity = client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(54),
+        ).json()
+        assert len(activity["replies"]) == 1
+        assert activity["replies"][0]["note"] == payload["note"]
+        assert len(activity["contacts"]) == 1
+        assert activity["submission_attempts"] == []
+        detail = client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(54),
+        ).json()
+        assert detail["stage"] == "saved"
+        assert detail["last_reply_at"].startswith("2026-10-17")
+        assert detail["next_followup_at"] is None
+        assert client.get("/career-workspace/applications", headers=headers(54)).json()[0]["next_followup_at"] is None
+        assert client.post(contact_endpoint, headers=headers(54), json={
+            "channel": "email", "note": "Answered the availability question",
+            "contacted_at": "2026-10-17T12:00:00Z",
+            "next_followup_at": "2026-10-21T10:00:00Z", "confirmed_contact": True,
+        }).status_code == 200
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}", headers=headers(54),
+        ).json()["next_followup_at"].startswith("2026-10-21")
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(55),
+        ).status_code == 404
+
+
+def test_gmail_candidate_reply_retries_are_idempotent_and_cannot_move_between_roles():
+    with TestClient(app) as client:
+        first = client.post("/career-workspace/applications", headers=headers(71), json={
+            "company": "One", "role": "Analyst", "stage": "applied",
+        }).json()
+        second = client.post("/career-workspace/applications", headers=headers(71), json={
+            "company": "Two", "role": "Engineer", "stage": "applied",
+        }).json()
+        payload = {"channel": "email", "note": "Recruiter requested an interview",
+                   "received_at": "2026-10-17T10:00:00Z", "confirmed_reply": True,
+                   "idempotency_key": "a" * 64}
+        endpoint = f"/career-workspace/applications/{first['id']}/replies"
+        original = client.post(endpoint, headers=headers(71), json=payload)
+        retry = client.post(endpoint, headers=headers(71), json=payload)
+        assert original.status_code == retry.status_code == 200
+        assert original.json()["id"] == retry.json()["id"]
+        assert len(client.get(f"/career-workspace/applications/{first['id']}/activity", headers=headers(71)).json()["replies"]) == 1
+        moved = client.post(f"/career-workspace/applications/{second['id']}/replies", headers=headers(71), json=payload)
+        assert moved.status_code == 409
+        assert client.post(endpoint, headers=headers(72), json=payload).status_code == 404
+
+
+def test_legacy_reply_table_gains_idempotency_key_and_unique_index():
+    async def check():
+        old_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with old_engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "CREATE TABLE career_reply_events (id VARCHAR PRIMARY KEY, user_id VARCHAR NOT NULL)"
+                )
+                await ensure_career_reply_idempotency(connection)
+                await ensure_career_reply_idempotency(connection)
+                await connection.exec_driver_sql(
+                    "INSERT INTO career_reply_events (id, user_id, idempotency_key) VALUES ('one', '7', 'key')"
+                )
+                try:
+                    await connection.exec_driver_sql(
+                        "INSERT INTO career_reply_events (id, user_id, idempotency_key) VALUES ('two', '7', 'key')"
+                    )
+                except Exception:
+                    pass
+                else:
+                    raise AssertionError("The upgrade must enforce user-scoped reply idempotency")
+        finally:
+            await old_engine.dispose()
+    asyncio.run(check())
+
+
 def test_legacy_scores_are_unverified_after_schema_upgrade():
     async def check():
         old_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -540,6 +725,32 @@ def test_legacy_scores_are_unverified_after_schema_upgrade():
                 assert row == (95, "unverified")
         finally:
             await old_engine.dispose()
+    asyncio.run(check())
+
+
+def test_legacy_terminal_records_remain_unclassified_after_schema_upgrade():
+    async def check():
+        old_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with old_engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "CREATE TABLE career_applications (id VARCHAR PRIMARY KEY, stage VARCHAR)"
+                )
+                await connection.exec_driver_sql(
+                    "CREATE TABLE career_stage_events (id VARCHAR PRIMARY KEY, to_stage VARCHAR)"
+                )
+                await connection.exec_driver_sql(
+                    "INSERT INTO career_applications (id, stage) VALUES ('legacy', 'closed')"
+                )
+                await ensure_career_outcome_kind(connection)
+                await ensure_career_outcome_kind(connection)
+                row = (await connection.exec_driver_sql(
+                    "SELECT outcome_kind FROM career_applications WHERE id = 'legacy'"
+                )).one()
+                assert row[0] is None
+        finally:
+            await old_engine.dispose()
+
     asyncio.run(check())
 
 

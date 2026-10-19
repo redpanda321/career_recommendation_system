@@ -288,6 +288,11 @@ async def save_canonical_contact(application_id: str, request: Request, _user: s
     return await _forward(request, f"applications/{application_id}/contacts", "POST", await request.json())
 
 
+@router.post("/applications/{application_id}/replies")
+async def save_canonical_reply(application_id: str, request: Request, _user: str = Depends(career_user)):
+    return await _forward(request, f"applications/{application_id}/replies", "POST", await request.json())
+
+
 @router.post("/import")
 async def import_career_records(
     payload: WorkspaceImportRequest, request: Request, _user: str = Depends(career_user),
