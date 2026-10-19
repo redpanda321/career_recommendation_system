@@ -23,6 +23,7 @@ async def create_db_and_tables():
         await ensure_career_score_kind(conn)
         await ensure_career_evaluation_binding(conn)
         await ensure_career_evaluation_source_binding(conn)
+        await ensure_career_outcome_kind(conn)
 
 
 async def ensure_submission_worker_columns(conn):
@@ -81,6 +82,19 @@ async def ensure_career_evaluation_source_binding(conn):
             "ALTER TABLE career_applications ADD COLUMN "
             f"{optional}evaluation_source_artifact_id VARCHAR(36)"
         )
+
+
+async def ensure_career_outcome_kind(conn):
+    """Keep existing terminal records unclassified until the candidate labels them."""
+    for table in ("career_applications", "career_stage_events"):
+        columns = await conn.run_sync(lambda sync_conn: {
+            column["name"] for column in inspect(sync_conn).get_columns(table)
+        })
+        if "outcome_kind" not in columns:
+            optional = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
+            await conn.exec_driver_sql(
+                f"ALTER TABLE {table} ADD COLUMN {optional}outcome_kind VARCHAR(32)"
+            )
 
 # Dependency for FastAPI routes
 async def get_db():

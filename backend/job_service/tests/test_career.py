@@ -15,7 +15,7 @@ from jose import jwt
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.database import AsyncSessionLocal, Base, engine
-from app.database import ensure_career_score_kind
+from app.database import ensure_career_outcome_kind, ensure_career_score_kind
 from app.models import (
     CareerApplication, CareerArtifact, CareerCandidateProfile, CareerComparisonSnapshot,
     CareerContactEvent, CareerPipelineEntry, CareerReplyEvent, CareerStageEvent,
@@ -484,6 +484,41 @@ def test_profile_and_feedback_are_candidate_scoped_and_auditable():
         assert drafted.status_code == 200, drafted.text
 
 
+def test_terminal_outcomes_are_candidate_labelled_and_reversible():
+    with TestClient(app) as client:
+        case = client.post("/career-workspace/applications", headers=headers(56), json={
+            "company": "Outcome Co", "role": "Engineer", "stage": "applied",
+        }).json()
+        endpoint = f"/career-workspace/applications/{case['id']}/feedback"
+        assert client.post(endpoint, headers=headers(57), json={
+            "stage": "closed", "outcome_kind": "rejected", "note": "Employer sent a rejection",
+        }).status_code == 404
+        assert client.post(endpoint, headers=headers(56), json={
+            "stage": "screening", "outcome_kind": "rejected", "note": "Wrong stage",
+        }).status_code == 400
+        assert client.post(endpoint, headers=headers(56), json={
+            "stage": "accepted", "outcome_kind": "rejected", "note": "Wrong reason",
+        }).status_code == 400
+        changed = client.post(endpoint, headers=headers(56), json={
+            "stage": "closed", "outcome_kind": "rejected", "note": "Employer sent a rejection",
+        })
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["application"]["outcome_kind"] == "rejected"
+        assert client.get(
+            f"/career-workspace/applications/{case['id']}/activity", headers=headers(56),
+        ).json()["feedback"][0]["outcome_kind"] == "rejected"
+        reopened = client.post(endpoint, headers=headers(56), json={
+            "stage": "interview", "note": "Corrected an incorrect closure",
+        })
+        assert reopened.status_code == 200, reopened.text
+        assert reopened.json()["application"]["outcome_kind"] is None
+        accepted = client.post(endpoint, headers=headers(56), json={
+            "stage": "accepted", "outcome_kind": "accepted", "note": "I accepted the offer",
+        })
+        assert accepted.status_code == 200, accepted.text
+        assert client.get("/career-workspace/applications", headers=headers(56)).json()[0]["outcome_kind"] == "accepted"
+
+
 def test_outreach_draft_is_versioned_and_does_not_record_employer_contact():
     with TestClient(app) as client:
         case = client.post("/career-workspace/applications", headers=headers(52), json={
@@ -642,6 +677,32 @@ def test_legacy_scores_are_unverified_after_schema_upgrade():
                 assert row == (95, "unverified")
         finally:
             await old_engine.dispose()
+    asyncio.run(check())
+
+
+def test_legacy_terminal_records_remain_unclassified_after_schema_upgrade():
+    async def check():
+        old_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with old_engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    "CREATE TABLE career_applications (id VARCHAR PRIMARY KEY, stage VARCHAR)"
+                )
+                await connection.exec_driver_sql(
+                    "CREATE TABLE career_stage_events (id VARCHAR PRIMARY KEY, to_stage VARCHAR)"
+                )
+                await connection.exec_driver_sql(
+                    "INSERT INTO career_applications (id, stage) VALUES ('legacy', 'closed')"
+                )
+                await ensure_career_outcome_kind(connection)
+                await ensure_career_outcome_kind(connection)
+                row = (await connection.exec_driver_sql(
+                    "SELECT outcome_kind FROM career_applications WHERE id = 'legacy'"
+                )).one()
+                assert row[0] is None
+        finally:
+            await old_engine.dispose()
+
     asyncio.run(check())
 
 

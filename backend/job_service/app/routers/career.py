@@ -33,6 +33,10 @@ router = APIRouter(tags=["career-workspace"])
 
 SITES = {"indeed", "linkedin", "greenhouse", "lever", "workday"}
 STAGES = {"saved", "applied", "screening", "assessment", "interview", "offer", "accepted", "closed"}
+OUTCOME_KINDS = {
+    "accepted": {"accepted"},
+    "closed": {"rejected", "withdrawn", "declined", "expired", "no_response", "other"},
+}
 SOURCE_NAMES = {"career-compass", "career-ops", "ai-job-search", "proficiently", "hanggent"}
 
 
@@ -108,6 +112,7 @@ class EvaluationScoreIn(BaseModel):
 class StageFeedbackIn(BaseModel):
     stage: str
     note: str = Field(min_length=3, max_length=2000)
+    outcome_kind: str | None = Field(default=None, max_length=32)
 
 
 class ContactIn(BaseModel):
@@ -174,6 +179,7 @@ def _application_out(
     return {
         "id": item.id, "company": item.company, "role": item.role,
         "location": item.location, "job_url": item.job_url, "stage": item.stage,
+    "outcome_kind": item.outcome_kind,
         "fit_score": item.fit_score, "score_kind": item.score_kind,
         "evaluation_artifact_id": item.evaluation_artifact_id,
         "evaluation_source_artifact_id": item.evaluation_source_artifact_id,
@@ -247,6 +253,8 @@ async def record_candidate_feedback(
 ):
     if body.stage not in STAGES:
         raise HTTPException(400, "Invalid stage")
+    if body.outcome_kind is not None and body.outcome_kind not in OUTCOME_KINDS.get(body.stage, set()):
+        raise HTTPException(400, "Outcome reason does not match the selected stage")
     if len(body.note.strip()) < 3:
         raise HTTPException(400, "A meaningful feedback note is required")
     application = (await db.execute(select(CareerApplication).where(
@@ -257,9 +265,11 @@ async def record_candidate_feedback(
     previous = application.stage
     event = CareerStageEvent(
         application_id=application_id, user_id=user_id, from_stage=previous,
-        to_stage=body.stage, note=body.note.strip(), source="candidate",
+        to_stage=body.stage, outcome_kind=body.outcome_kind,
+        note=body.note.strip(), source="candidate",
     )
     application.stage = body.stage
+    application.outcome_kind = body.outcome_kind
     db.add(event)
     await db.commit()
     await db.refresh(application)
@@ -489,7 +499,7 @@ async def application_activity(
                                  "receipt": item.receipt, "error": item.error}
                                 for item in attempts],
         "feedback": [{"id": item.id, "from_stage": item.from_stage,
-                      "to_stage": item.to_stage, "note": item.note,
+    "to_stage": item.to_stage, "outcome_kind": item.outcome_kind, "note": item.note,
                       "source": item.source, "created_at": item.created_at}
                      for item in feedback],
         "contacts": [{"id": item.id, "channel": item.channel, "note": item.note,
