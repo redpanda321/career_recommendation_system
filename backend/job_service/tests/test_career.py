@@ -67,6 +67,34 @@ def test_requires_scoped_bridge_identity():
         }).status_code == 401
 
 
+def test_mutual_fit_artifact_is_versioned_and_owned():
+    with TestClient(app) as client:
+        owner = headers(5081)
+        other = headers(5082)
+        application = client.post("/career-workspace/applications", headers=owner, json={
+            "company": "Example", "role": "Engineer", "sources": ["career-compass"],
+        })
+        assert application.status_code == 200, application.text
+        application_id = application.json()["id"]
+        path = f"/career-workspace/applications/{application_id}/artifacts"
+        body = {"kind": "mutual_fit", "source": "career-compass",
+                "content_markdown": '{"score_kind":"mutual_fit_v1"}'}
+        assert client.post(path, headers=other, json=body).status_code == 404
+        first = client.post(path, headers=owner, json=body)
+        assert first.status_code == 200, first.text
+        assert first.json()["version"] == 1
+        assert client.post(path, headers=owner, json=body).json()["version"] == 2
+        activity = client.get(
+            f"/career-workspace/applications/{application_id}/activity", headers=owner,
+        )
+        assert activity.status_code == 200
+        assert [item["version"] for item in activity.json()["artifacts"]
+                if item["kind"] == "mutual_fit"] == [1, 2]
+        assert client.get(
+            f"/career-workspace/applications/{application_id}/activity", headers=other,
+        ).status_code == 404
+
+
 def test_pipeline_is_database_owned_and_user_isolated(monkeypatch, tmp_path):
     # A leftover file-root setting must not redirect the canonical write path.
     monkeypatch.setenv("CAREER_OPS_DATA_ROOT", str(tmp_path / "unused"))
